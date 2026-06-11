@@ -1,0 +1,12 @@
+[
+  {"id": "1", "task": "Find any PDF files in the Downloads folder", "expected": ".pdf"},
+  {"id": "2", "task": "List all markdown files in the workspace", "expected": ".md"},
+  {"id": "3", "task": "Find the most recently modified file", "expected": ""},
+  {"id": "4", "task": "Search for files containing the word 'report'", "expected": "report"},
+  {"id": "5", "task": "Find configuration files with .json extension", "expected": ".json"},
+  {"id": "6", "task": "Locate the IDENTITY.md file in the workspace", "expected": "IDENTITY.md"},
+  {"id": "7", "task": "Find the skill files under the skills directory", "expected": "SKILL.md"},
+  {"id": "8", "task": "List all Python files in the project", "expected": ".py"},
+  {"id": "9", "task": "Find log files modified in the last week", "expected": ".log"},
+  {"id": "10", "task": "Show the directory structure of the workspace", "expected": ""}
+]
