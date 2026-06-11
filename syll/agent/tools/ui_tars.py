@@ -11,10 +11,11 @@ Architecture follows UI-TARS-desktop patterns:
 - call_user action for human intervention requests
 - Key screenshots collection (first + last)
 - LiteLLM for unified provider support
+- GUI execution monitor overlay for real-time progress visibility
 """
 
 import base64
-import inspect
+import json
 import mimetypes
 import re
 import tempfile
@@ -66,10 +67,62 @@ finished(content='summary')
 4. If you are stuck, the action is not working, or you need human help, use call_user()
 5. When the task is complete, use finished() with a summary
 6. If you see a permission/authorization dialog, use call_user() to ask the user
+
+## Coordinate Guidelines
+
+- The screenshot has a known width and height (provided with each image)
+- All coordinates must be in pixels within the image bounds
+- For buttons/icons: aim at the CENTER of the element, not the edge
+- For text fields: click in the middle of the text area
+- For checkboxes/radio buttons: click the small square/circle, not the label
+- When in doubt about exact position, aim for the visual center of the target element
 """
 
 MAX_SCREENSHOT_HISTORY = 5  # sliding window: images for last N screenshots
 MAX_REPEAT_ACTIONS = 3  # if same action repeated this many times, auto call_user
+
+# Adaptive resolution tiers — sorted highest→lowest per aspect ratio.
+# _compute_model_size picks the highest tier that fits the screen,
+# preserving maximum detail for accurate grounding.
+_RESOLUTION_TIERS: dict[str, list[tuple[int, int]]] = {
+    # 16:9 (most common: 4K, QHD, FHD)
+    "16:9": [
+        (3840, 2160),  # 4K UHD
+        (2560, 1440),  # QHD   ← sweet spot for 4K screens
+        (1920, 1080),  # FHD
+        (1600, 900),
+        (1366, 768),
+    ],
+    # 16:10
+    "16:10": [
+        (2560, 1600),
+        (1920, 1200),
+        (1440, 900),
+        (1280, 800),
+    ],
+    # 4:3
+    "4:3": [
+        (2048, 1536),
+        (1600, 1200),
+        (1024, 768),
+    ],
+    # 3:2 (Surface etc.)
+    "3:2": [
+        (2256, 1504),
+        (1920, 1280),
+        (1440, 960),
+    ],
+}
+
+# Approximate ratio → tier key mapping (tolerance ±2%)
+_ASPECT_RATIOS: list[tuple[float, str]] = [
+    (16 / 9,  "16:9"),
+    (16 / 10, "16:10"),
+    (4 / 3,   "4:3"),
+    (3 / 2,   "3:2"),
+]
+
+_CONFIG_FILE = Path.home() / ".syll" / "config.json"
 
 
 @dataclass
@@ -90,6 +143,7 @@ class Conversation:
     screenshot_b64: str | None = None  # base64 encoded screenshot
     screenshot_mime: str = "image/png"
     is_icl: bool = False  # True for in-context learning examples
+    img_size: tuple[int, int] | None = None  # (width, height) for dimension injection
 
 
 class UITarsTool(Tool):
@@ -111,6 +165,7 @@ class UITarsTool(Tool):
         self._retry = RetryConfig()
         self._event_store: EventStore | None = None
         self._model_img_size: tuple[int, int] = (0, 0)  # set by _take_screenshot
+        self._monitor_launched = False
 
     @property
     def name(self) -> str:
@@ -147,9 +202,43 @@ class UITarsTool(Tool):
             "required": ["instruction"],
         }
 
+    # ── Monitor helpers ────────────────────────────────────────────────
+
+    def _monitor_write(self, **kwargs: Any) -> None:
+        """Write state to GUI monitor overlay."""
+        try:
+            from syll.desktop.gui_monitor import write_gui_state
+            write_gui_state(**kwargs)
+        except Exception:
+            pass  # Monitor is optional — never block execution
+
+    def _monitor_launch(self) -> None:
+        """Launch GUI monitor overlay (idempotent)."""
+        if self._monitor_launched:
+            return
+        try:
+            from syll.desktop.gui_monitor import launch_gui_monitor
+            launch_gui_monitor()
+            self._monitor_launched = True
+        except Exception:
+            pass
+
+    def _monitor_stop(self) -> None:
+        """Stop GUI monitor overlay."""
+        if not self._monitor_launched:
+            return
+        try:
+            from syll.desktop.gui_monitor import stop_gui_monitor
+            stop_gui_monitor()
+        except Exception:
+            pass
+        self._monitor_launched = False
+
+    # ── Main execution loop ────────────────────────────────────────────
+
     async def execute(
         self, instruction: str, max_steps: int | None = None,
-        skill_name: str | None = None, progress_callback: Any = None, **kwargs: Any,
+        skill_name: str | None = None, **kwargs: Any,
     ) -> str | ToolResult:
         """Execute a GUI task using multi-turn screenshot -> UI-TARS -> action loop.
 
@@ -161,127 +250,174 @@ class UITarsTool(Tool):
         screenshots: list[str] = []  # file paths for returning to user
         recent_actions: list[str] = []  # for stuck detection
 
-        # Inject ICL examples from recorded GUI skill
-        if skill_name:
-            icl_turns = self._build_icl_context(skill_name)
-            if icl_turns:
-                conversations.extend(icl_turns)
-                logger.info(f"Injected {len(icl_turns)} ICL turns from skill '{skill_name}'")
+        # Launch GUI monitor overlay
+        self._monitor_launch()
+        self._monitor_write(
+            status="running",
+            instruction=instruction,
+            step=0,
+            max_steps=steps,
+        )
 
-        for step in range(1, steps + 1):
-            logger.info(f"GUI step {step}/{steps}: {instruction}")
-            await self._emit_progress(progress_callback, {"kind": "gui_step", "step": step, "message": f"GUI step {step}/{steps}"})
+        try:
+            # Inject ICL examples from recorded GUI skill
+            if skill_name:
+                icl_turns = self._build_icl_context(skill_name)
+                if icl_turns:
+                    conversations.extend(icl_turns)
+                    logger.info(f"Injected {len(icl_turns)} ICL turns from skill '{skill_name}'")
 
-            # --- Screenshot with retry ---
-            screenshot_path = await self._take_screenshot_with_retry(step)
-            if not screenshot_path:
-                return ToolResult(text="Error: Failed to capture screenshot after retries")
-            screenshots.append(screenshot_path)
-            await self._emit_progress(
-                progress_callback,
-                {"kind": "screenshot", "step": step, "message": "Captured screenshot", "screenshot": screenshot_path},
-            )
+            for step in range(1, steps + 1):
+                logger.info(f"GUI step {step}/{steps}: {instruction}")
 
-            # Read screenshot as base64
-            with open(screenshot_path, "rb") as f:
-                screenshot_b64 = base64.b64encode(f.read()).decode()
-
-            # Add screenshot as user turn
-            conversations.append(Conversation(
-                role="user",
-                screenshot_b64=screenshot_b64,
-                screenshot_mime=self._guess_image_mime(Path(screenshot_path)),
-            ))
-
-            # --- Call UI-TARS with retry (multi-turn conversation) ---
-            response_text = await self._call_uitars_with_retry(
-                instruction, conversations
-            )
-            if not response_text:
-                return ToolResult(
-                    text="Error: UI-TARS API call failed after retries",
-                    media=[screenshot_path],
+                # Update monitor
+                self._monitor_write(
+                    status="running",
+                    instruction=instruction,
+                    step=step,
+                    max_steps=steps,
                 )
 
-            # Parse response and add as assistant turn
-            thought, action_str = self._parse_response(response_text)
-            conversations.append(Conversation(
-                role="assistant",
-                text=response_text,
-            ))
-            logger.info(f"  Thought: {thought}")
-            logger.info(f"  Action: {action_str}")
-            if thought:
-                await self._emit_progress(progress_callback, {"kind": "gui_thought", "step": step, "message": thought, "thought": thought})
-            await self._emit_progress(progress_callback, {"kind": "gui_action", "step": step, "message": action_str, "action": action_str})
+                # --- Screenshot with retry ---
+                screenshot_path = await self._take_screenshot_with_retry(step)
+                if not screenshot_path:
+                    self._monitor_write(status="error", instruction=instruction,
+                                         step=step, max_steps=steps,
+                                         error="截图失败")
+                    return ToolResult(text="Error: Failed to capture screenshot after retries")
+                screenshots.append(screenshot_path)
 
-            # --- Stuck detection ---
-            recent_actions.append(action_str)
-            if len(recent_actions) >= MAX_REPEAT_ACTIONS:
-                last_n = recent_actions[-MAX_REPEAT_ACTIONS:]
-                if all(a == last_n[0] for a in last_n):
-                    logger.warning(f"Stuck: same action repeated {MAX_REPEAT_ACTIONS} times")
+                # Read screenshot as base64
+                with open(screenshot_path, "rb") as f:
+                    screenshot_b64 = base64.b64encode(f.read()).decode()
+
+                # Add screenshot as user turn WITH image dimensions
+                conversations.append(Conversation(
+                    role="user",
+                    screenshot_b64=screenshot_b64,
+                    screenshot_mime=self._guess_image_mime(Path(screenshot_path)),
+                    img_size=self._model_img_size,  # ← inject dimensions
+                ))
+
+                # --- Call UI-TARS with retry (multi-turn conversation) ---
+                response_text = await self._call_uitars_with_retry(
+                    instruction, conversations
+                )
+                if not response_text:
+                    self._monitor_write(status="error", instruction=instruction,
+                                         step=step, max_steps=steps,
+                                         error="模型调用失败")
                     return ToolResult(
-                        text=f"GUI agent appears stuck — repeated action '{action_str}' "
-                             f"{MAX_REPEAT_ACTIONS} times. The action may not be working. "
-                             f"Please check the screen and try a different approach.",
+                        text="Error: UI-TARS API call failed after retries",
                         media=[screenshot_path],
                     )
 
-            # Check for finished
-            finished_match = re.match(r"finished\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
-            if finished_match:
-                summary = finished_match.group(1)
-                key_shots = self._key_screenshots(screenshots)
-                return ToolResult(
-                    text=f"GUI task completed: {summary}\n\nSteps taken: {step}",
-                    media=key_shots,
+                # Parse response and add as assistant turn
+                thought, action_str = self._parse_response(response_text)
+                conversations.append(Conversation(
+                    role="assistant",
+                    text=response_text,
+                ))
+                logger.info(f"  Thought: {thought}")
+                logger.info(f"  Action: {action_str}")
+
+                # Update monitor with current action
+                self._monitor_write(
+                    status="running",
+                    instruction=instruction,
+                    step=step,
+                    max_steps=steps,
+                    action=action_str,
+                    thought=thought,
                 )
 
-            # Check for call_user
-            call_user_match = re.match(r"call_user\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
-            if call_user_match:
-                message = call_user_match.group(1)
-                return ToolResult(
-                    text=f"GUI agent requests human intervention: {message}",
-                    media=[screenshot_path],
-                )
+                # --- Stuck detection ---
+                recent_actions.append(action_str)
+                if len(recent_actions) >= MAX_REPEAT_ACTIONS:
+                    last_n = recent_actions[-MAX_REPEAT_ACTIONS:]
+                    if all(a == last_n[0] for a in last_n):
+                        logger.warning(f"Stuck: same action repeated {MAX_REPEAT_ACTIONS} times")
+                        self._monitor_write(status="error", instruction=instruction,
+                                             step=step, max_steps=steps,
+                                             action=action_str, error=f"重复操作 {MAX_REPEAT_ACTIONS} 次")
+                        return ToolResult(
+                            text=f"GUI agent appears stuck — repeated action '{action_str}' "
+                                 f"{MAX_REPEAT_ACTIONS} times. The action may not be working. "
+                                 f"Please check the screen and try a different approach.",
+                            media=[screenshot_path],
+                        )
 
-            # --- Execute action with retry ---
-            intent_text = "\n".join(part for part in (instruction, thought) if part)
-            success, msg = await self._execute_action_with_retry(action_str, intent_text=intent_text)
-            await self._emit_progress(progress_callback, {"kind": "gui_result", "step": step, "message": msg, "result": msg})
-            if not success:
-                return ToolResult(
-                    text=f"Action failed at step {step}: {msg}",
-                    media=[screenshot_path],
-                )
+                # Check for finished
+                finished_match = re.match(r"finished\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
+                if finished_match:
+                    summary = finished_match.group(1)
+                    key_shots = self._key_screenshots(screenshots)
+                    self._monitor_write(status="finished", instruction=instruction,
+                                         step=step, max_steps=steps, action=f"完成: {summary}")
+                    return ToolResult(
+                        text=f"GUI task completed: {summary}\n\nSteps taken: {step}",
+                        media=key_shots,
+                    )
 
-            # Log GUI action event
-            if self._event_store:
-                event = Event(
-                    agent_type="gui_agent",
-                    event_type="action",
-                    source=EventSource(platform="desktop", chat_id="gui", user_id="system"),
-                    content=EventContent(
-                        text=f"Instruction: {instruction}\nThought: {thought}\nAction: {action_str}",
+                # Check for call_user
+                call_user_match = re.match(r"call_user\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
+                if call_user_match:
+                    message = call_user_match.group(1)
+                    self._monitor_write(status="running", instruction=instruction,
+                                         step=step, max_steps=steps,
+                                         action=f"请求人工介入: {message}")
+                    return ToolResult(
+                        text=f"GUI agent requests human intervention: {message}",
                         media=[screenshot_path],
-                        metadata={
-                            "step": step,
-                            "action": action_str,
-                            "thought": thought,
-                            "skill_name": skill_name,
-                        },
-                    ),
-                )
-                self._event_store.log_event(event)
+                    )
 
-        # Max steps reached
-        key_shots = self._key_screenshots(screenshots)
-        return ToolResult(
-            text=f"Reached max steps ({steps}). The task may not be complete.",
-            media=key_shots,
-        )
+                # --- Execute action with retry ---
+                intent_text = "\n".join(part for part in (instruction, thought) if part)
+                success, msg = await self._execute_action_with_retry(action_str, intent_text=intent_text)
+                if not success:
+                    self._monitor_write(status="error", instruction=instruction,
+                                         step=step, max_steps=steps,
+                                         action=action_str, error=msg)
+                    return ToolResult(
+                        text=f"Action failed at step {step}: {msg}",
+                        media=[screenshot_path],
+                    )
+
+                # Log GUI action event
+                if self._event_store:
+                    event = Event(
+                        agent_type="gui_agent",
+                        event_type="action",
+                        source=EventSource(platform="desktop", chat_id="gui", user_id="system"),
+                        content=EventContent(
+                            text=f"Instruction: {instruction}\nThought: {thought}\nAction: {action_str}",
+                            media=[screenshot_path],
+                            metadata={
+                                "step": step,
+                                "action": action_str,
+                                "thought": thought,
+                                "skill_name": skill_name,
+                            },
+                        ),
+                    )
+                    self._event_store.log_event(event)
+
+            # Max steps reached
+            key_shots = self._key_screenshots(screenshots)
+            self._monitor_write(status="finished", instruction=instruction,
+                                 step=steps, max_steps=steps,
+                                 error=f"达到最大步数 {steps}")
+            return ToolResult(
+                text=f"Reached max steps ({steps}). The task may not be complete.",
+                media=key_shots,
+            )
+        except Exception as e:
+            self._monitor_write(status="error", instruction=instruction,
+                                 step=0, max_steps=steps, error=str(e))
+            raise
+        finally:
+            # Monitor stays for a few seconds to show final state, then auto-hides
+            pass  # monitor auto-hides via QTimer.singleShot in gui_monitor.py
 
     def _key_screenshots(self, screenshots: list[str]) -> list[str]:
         """Return key screenshots: first + last (deduplicated)."""
@@ -290,17 +426,6 @@ class UITarsTool(Tool):
         if len(screenshots) == 1:
             return screenshots[:]
         return [screenshots[0], screenshots[-1]]
-
-    @staticmethod
-    async def _emit_progress(progress_callback: Any, event: dict[str, Any]) -> None:
-        if not progress_callback:
-            return
-        try:
-            result = progress_callback(event)
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            logger.debug(f"UI-TARS progress callback failed: {exc}")
 
     # ----- Retry wrappers -----
 
@@ -356,28 +481,101 @@ class UITarsTool(Tool):
                 if img.width > logical_w or img.height > logical_h:
                     img = img.resize((logical_w, logical_h), Image.LANCZOS)
 
-                # Scale to WXGA/XGA/FWXGA target for model (matches ShowUI-Aloha)
+                # Adaptive resolution — picks the best tier for the screen
                 model_w, model_h = self._compute_model_size(img.width, img.height)
-                if model_w < img.width:
+                if model_w != img.width or model_h != img.height:
                     img = img.resize((model_w, model_h), Image.LANCZOS)
                 self._model_img_size = (img.width, img.height)
 
+                logger.debug(
+                    f"Screenshot: screen={img.width}x{img.height} → model={self._model_img_size}"
+                )
                 img.save(path)
             return path
         except Exception as e:
             logger.error(f"Screenshot failed: {e}")
             return None
 
-    @staticmethod
-    def _compute_model_size(w: int, h: int) -> tuple[int, int]:
-        """Match aspect ratio to XGA/WXGA/FWXGA target (same logic as ShowUI-Aloha)."""
-        from syll.agent.tools.coordinate_transform import SCALING_TARGETS
+    def _compute_model_size(self, w: int, h: int) -> tuple[int, int]:
+        """Pick the best resolution tier for the current screen.
 
+        Adaptive strategy:
+          1. Read ``tools.gui.modelResolution`` from config:
+             - ``"auto"`` (default) — pick highest tier ≤ screen size
+             - ``"original"``       — no scaling, keep native resolution
+             - ``"2160p"`` / ``"1440p"`` / ``"1080p"`` — force a specific cap
+             - ``"WIDTHxHEIGHT"``   — exact custom target (e.g. ``"2560x1440"``)
+          2. Match aspect ratio, then pick the highest fitting tier.
+          3. If no tier fits, compute proportional downscale to ~3.7 Mpx.
+
+        For a 4K screen (3840×2160) the auto result is **2560×1440** (QHD),
+        preserving 44 % of pixels vs only 25 % at 1080p.
+        """
+        # --- Config override ---
+        cfg_res = self._read_model_resolution_config()
+        if cfg_res == "original":
+            return w, h
+        if isinstance(cfg_res, tuple):
+            return cfg_res
+
+        # --- Auto: pick highest matching tier ---
         ratio = w / h
-        for tw, th in SCALING_TARGETS.values():
-            if abs(tw / th - ratio) < 0.02 and tw < w:
-                return tw, th
-        return (1280, 800)  # fallback WXGA
+        for target_ratio, tier_key in _ASPECT_RATIOS:
+            if abs(ratio - target_ratio) < 0.03:
+                for tw, th in _RESOLUTION_TIERS[tier_key]:
+                    if tw <= w and th <= h:
+                        return tw, th
+                # Screen is smaller than all tiers → keep native
+                return w, h
+
+        # --- No matching aspect ratio → proportional scale ---
+        target_pixels = 3_700_000  # ≈ 2560×1440
+        if w * h <= target_pixels * 1.2:
+            return w, h
+        scale = (target_pixels / (w * h)) ** 0.5
+        return int(w * scale), int(h * scale)
+
+    @staticmethod
+    def _read_model_resolution_config() -> str | tuple[int, int] | None:
+        """Read ``tools.gui.modelResolution`` from config file.
+
+        Returns:
+            - ``None`` / ``"auto"`` → use adaptive tier logic
+            - ``"original"`` → no scaling
+            - ``"2160p"`` / ``"1440p"`` / ``"1080p"`` → capped resolution
+            - ``(w, h)`` tuple → exact custom target
+        """
+        try:
+            if not _CONFIG_FILE.exists():
+                return None
+            cfg = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+            val = cfg.get("tools", {}).get("gui", {}).get("modelResolution", "auto")
+        except Exception:
+            return None
+
+        if not val or val == "auto":
+            return None
+
+        if val == "original":
+            return "original"
+
+        # Named presets
+        _PRESETS = {
+            "2160p": (3840, 2160),
+            "1440p": (2560, 1440),
+            "1080p": (1920, 1080),
+            "768p":  (1366, 768),
+        }
+        if val in _PRESETS:
+            return _PRESETS[val]
+
+        # Custom "WxH" format
+        m = re.match(r"(\d+)\s*[x×]\s*(\d+)", val)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+
+        logger.warning(f"Unknown modelResolution value: {val!r}, falling back to auto")
+        return None
 
     async def _call_uitars(
         self,
@@ -388,7 +586,7 @@ class UITarsTool(Tool):
 
         Following UI-TARS-desktop pattern:
         - First message includes system prompt + instruction as user text
-        - Each step adds: user (screenshot image) → assistant (thought+action)
+        - Each step adds: user (screenshot image + dimensions) → assistant (thought+action)
         - Sliding window: only last N screenshots include base64 images
         """
         try:
@@ -415,17 +613,25 @@ class UITarsTool(Tool):
             for i, conv in enumerate(conversations):
                 if conv.role == "user" and conv.screenshot_b64:
                     if i in image_turn_indices or conv.is_icl:
-                        # Include image
+                        # Build content with image + dimension hint
+                        content_parts: list[dict] = [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{conv.screenshot_mime};base64,{conv.screenshot_b64}"
+                                },
+                            }
+                        ]
+                        # Inject image dimensions so the model knows the coordinate space
+                        if conv.img_size:
+                            iw, ih = conv.img_size
+                            content_parts.append({
+                                "type": "text",
+                                "text": f"[Screenshot size: {iw}x{ih} pixels. Coordinates must be within (0,0)-({iw},{ih}).]",
+                            })
                         messages.append({
                             "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{conv.screenshot_mime};base64,{conv.screenshot_b64}"
-                                    },
-                                }
-                            ],
+                            "content": content_parts,
                         })
                     else:
                         # Older screenshot — text placeholder only
@@ -456,7 +662,7 @@ class UITarsTool(Tool):
                 api_key=api_key,
                 api_base=api_base,
                 max_tokens=1024,
-                temperature=0.1,
+                temperature=0.05,  # lower for more deterministic coordinate output
             )
 
             return response.choices[0].message.content
@@ -469,7 +675,7 @@ class UITarsTool(Tool):
         thought = ""
         action = ""
 
-        thought_match = re.search(r"Thought:\s*(.+?)(?=Action:|$)", text, re.DOTALL)
+        thought_match = re.search(r"Thought:\s*(.+?)(=Action:|$)", text, re.DOTALL)
         if thought_match:
             thought = thought_match.group(1).strip()
 
@@ -516,353 +722,254 @@ class UITarsTool(Tool):
                 )
                 continue
 
-            screenshot_b64 = base64.b64encode(kf_path.read_bytes()).decode()
+            kf_data = kf_path.read_bytes()
+            screenshot_b64 = base64.b64encode(kf_data).decode()
+            mime = self._guess_image_mime(kf_path)
 
-            # User turn: screenshot
+            # User turn with screenshot
             turns.append(Conversation(
                 role="user",
                 screenshot_b64=screenshot_b64,
-                screenshot_mime=self._guess_image_mime(kf_path),
+                screenshot_mime=mime,
                 is_icl=True,
             ))
 
-            # Assistant turn: thought + action
-            action_str = self._format_action(step.action)
-            thought = step.action.description or f"Perform {step.action.type}"
-            response_text = f"Thought: {thought}\nAction: {action_str}"
+            # Assistant turn — reconstruct action in UI-TARS format
+            act = step.action
+            thought_text = act.description or f"Execute {act.type} action"
+
+            if act.type in ("click", "left_click", "right_click", "double_click") and act.coordinates:
+                action_str = f"{act.type}(start='({act.coordinates[0]}, {act.coordinates[1]})')"
+            elif act.type == "drag" and act.coordinates and act.end_coordinates:
+                action_str = (
+                    f"drag(start='({act.coordinates[0]}, {act.coordinates[1]})', "
+                    f"end='({act.end_coordinates[0]}, {act.end_coordinates[1]})')"
+                )
+            elif act.type == "type" and act.content:
+                action_str = f"type(content='{act.content}')"
+            elif act.type == "hotkey" and act.content:
+                action_str = f"hotkey(key='{act.content}')"
+            elif act.type == "scroll":
+                parts = []
+                if act.coordinates:
+                    parts.append(f"start='({act.coordinates[0]}, {act.coordinates[1]})'")
+                if act.content:
+                    parts.append(f"direction='{act.content}'")
+                action_str = f"scroll({', '.join(parts)})" if parts else "scroll()"
+            elif act.type == "wait":
+                action_str = "wait(seconds=2)"
+            else:
+                action_str = f"{act.type}()"
+
+            assistant_text = f"Thought: {thought_text}\nAction: {action_str}"
             turns.append(Conversation(
                 role="assistant",
-                text=response_text,
+                text=assistant_text,
                 is_icl=True,
             ))
 
         return turns
 
-    def _build_aloha_icl(self, skill, skill_name: str) -> list[Conversation]:
-        """Build ICL turns from an AlohaSkill with richer trace context."""
-        turns: list[Conversation] = []
+    def _build_aloha_icl(self, aloha_skill: Any, skill_name: str) -> list[Conversation]:
+        """Build ICL turns from an Aloha recorded skill.
 
-        for step in skill.steps:
-            # Prefer crop image (smaller, more focused), fallback to full
-            kf_filename = step.screenshot_crop or step.screenshot
-            if not kf_filename:
-                logger.warning(
-                    f"Aloha skill '{skill_name}' step {step.index} has no keyframe filenames for ICL"
-                )
+        Uses AlohaTrace data (observation/think/action/expectation) when available
+        for richer in-context learning.
+        """
+        turns: list[Conversation] = []
+        for step in aloha_skill.steps:
+            kf_path = self._aloha_skill_store.get_keyframe_path(
+                skill_name, step.screenshot
+            )
+            if not kf_path:
                 continue
 
-            kf_path = self._aloha_skill_store.get_keyframe_path(skill_name, kf_filename)
-            if not kf_path:
-                # Try the other image
-                logger.warning(
-                    f"Aloha skill '{skill_name}' step {step.index} missing keyframe '{kf_filename}', "
-                    "trying fallback"
-                )
-                alt_filename = step.screenshot if kf_filename == step.screenshot_crop else step.screenshot_crop
-                if alt_filename:
-                    kf_path = self._aloha_skill_store.get_keyframe_path(skill_name, alt_filename)
-                if not kf_path:
-                    logger.warning(
-                        f"Aloha skill '{skill_name}' step {step.index} has no usable keyframe for ICL"
-                    )
-                    continue
+            kf_data = kf_path.read_bytes()
+            screenshot_b64 = base64.b64encode(kf_data).decode()
+            mime = self._guess_image_mime(kf_path)
 
-            screenshot_b64 = base64.b64encode(kf_path.read_bytes()).decode()
-
-            # User turn: screenshot
+            # User turn with screenshot
             turns.append(Conversation(
                 role="user",
                 screenshot_b64=screenshot_b64,
-                screenshot_mime=self._guess_image_mime(kf_path),
+                screenshot_mime=mime,
                 is_icl=True,
             ))
 
-            # Assistant turn: use trace data for richer context if available
+            # Build assistant turn — prefer trace data, fall back to action fields
             if step.trace:
-                thought = step.trace.think or step.trace.observation or step.action.description
+                thought = step.trace.think or step.trace.observation or ""
+                action_str = step.trace.action or ""
             else:
-                thought = step.action.description or f"Perform {step.action.type}"
-                logger.warning(
-                    f"Aloha skill '{skill_name}' step {step.index} has no trace; using action description"
-                )
+                act = step.action
+                thought = act.description or f"Execute {act.type}"
+                if act.coordinates:
+                    action_str = f"{act.type}(start='({act.coordinates[0]}, {act.coordinates[1]})')"
+                else:
+                    action_str = f"{act.type}()"
 
-            action_str = self._format_aloha_icl_action(step)
-            response_text = f"Thought: {thought}\nAction: {action_str}"
+            assistant_text = ""
+            if thought:
+                assistant_text += f"Thought: {thought}\n"
+            assistant_text += f"Action: {action_str}"
+
             turns.append(Conversation(
                 role="assistant",
-                text=response_text,
+                text=assistant_text,
                 is_icl=True,
             ))
 
         return turns
-
-    def _format_aloha_icl_action(self, step) -> str:
-        """Format Aloha demo steps for richer ICL examples."""
-        intent_text = "\n".join(
-            part
-            for part in (
-                getattr(step.trace, "action", "") if step.trace else "",
-                getattr(step.trace, "think", "") if step.trace else "",
-                step.action.description,
-            )
-            if part
-        )
-        if step.action.type in ("click", "left_click"):
-            click_count = resolve_click_count("CLICK", {"intent": intent_text})
-            if click_count >= 2 and step.action.coordinates:
-                x, y = step.action.coordinates
-                return f"double_click(start='({x}, {y})')"
-        return self._format_action(step.action)
 
     @staticmethod
     def _guess_image_mime(path: Path) -> str:
-        """Guess image MIME type from a keyframe or screenshot path."""
+        """Guess MIME type from file extension."""
         mime, _ = mimetypes.guess_type(str(path))
-        if mime and mime.startswith("image/"):
-            return mime
-        return "image/png"
+        return mime or "image/png"
 
-    @staticmethod
-    def _format_action(action) -> str:
-        """Format a GUIAction into a UI-TARS action string."""
-        if action.type in ("click", "left_click"):
-            if action.coordinates:
-                return f"click(start='({action.coordinates[0]}, {action.coordinates[1]})')"
-            return "click()"
-        elif action.type == "double_click":
-            if action.coordinates:
-                return f"double_click(start='({action.coordinates[0]}, {action.coordinates[1]})')"
-            return "double_click()"
-        elif action.type == "right_click":
-            if action.coordinates:
-                return f"right_click(start='({action.coordinates[0]}, {action.coordinates[1]})')"
-            return "right_click()"
-        elif action.type == "drag":
-            start = action.coordinates or [0, 0]
-            end = action.end_coordinates or [0, 0]
-            return f"drag(start='({start[0]}, {start[1]})', end='({end[0]}, {end[1]})')"
-        elif action.type == "type":
-            return f"type(content='{action.content}')"
-        elif action.type == "hotkey":
-            return f"hotkey(key='{action.content}')"
-        elif action.type == "scroll":
-            if action.coordinates:
-                return f"scroll(start='({action.coordinates[0]}, {action.coordinates[1]})', direction='{action.content or 'down'}', amount=3)"
-            return f"scroll(direction='{action.content or 'down'}', amount=3)"
-        elif action.type == "wait":
-            return f"wait(seconds={action.content or '2'})"
-        return f"{action.type}()"
-
-    @staticmethod
-    def _parse_coords(s: str) -> tuple[int, int] | None:
-        """Extract (x, y) coordinates from various formats.
-
-        Supports:
-        - <point>x y</point>
-        - (x, y) or (x,y)
-        """
-        # Format: <point>x y</point>
-        m = re.search(r"<point>(\d+)\s+(\d+)</point>", s)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-        # Format: (x, y) or (x,y)
-        m = re.search(r"\((\d+)\s*,\s*(\d+)\)", s)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-        return None
+    # ----- Action execution -----
 
     async def _execute_action(
         self, action_str: str, intent_text: str = ""
     ) -> tuple[bool, str]:
-        """Execute a parsed GUI action via shared click backends.
+        """Parse and execute a GUI action string.
 
-        Supports both UI-TARS v1 format (<point>x y</point>) and
-        UI-TARS v1.5 format ((x, y)).
+        Dispatches to gui_click backends (pyautogui / pynput / quartz).
+        Coordinates are scaled from model image space to screen space.
         """
+        import pyautogui
+
         try:
-            import pyautogui
+            # Parse action name and argument string
+            match = re.match(r"(\w+)\((.*)\)", action_str.strip(), re.DOTALL)
+            if not match:
+                return False, f"Invalid action format: {action_str}"
 
-            pyautogui.FAILSAFE = True
-            pyautogui.PAUSE = 0.3
+            action_name = match.group(1)
+            args_str = match.group(2)
+            args = self._parse_action_args(args_str)
 
-            if re.match(r"(?:left_)?click\(", action_str):
-                coords = self._parse_coords(action_str)
-                if coords:
-                    x, y = self._transform_coords(*coords)
-                    raw = {"intent": intent_text, "action_text": action_str}
-                    if should_open_desktop_app_with_shortcut("CLICK", raw):
-                        message = await open_desktop_app_with_shortcut(
-                            pyautogui,
-                            x,
-                            y,
-                            raw=raw,
-                            config=self._config,
-                        )
-                        return True, message
-                    click_count = resolve_click_count("CLICK", raw)
-                    message = await perform_click_sequence(
-                        pyautogui,
-                        x,
-                        y,
-                        click_count,
-                        raw=raw,
-                        config=self._config,
-                    )
-                    return True, message
-                return False, f"Cannot parse coordinates: {action_str}"
+            if action_name in ("click", "left_click", "double_click"):
+                start = args.get("start")
+                if not start:
+                    return False, f"Missing start coordinates in: {action_str}"
+                x, y = self._parse_coords(start)
+                sx, sy = self._scale_to_screen(x, y)
 
-            if re.match(r"right_click\(", action_str):
-                coords = self._parse_coords(action_str)
-                if coords:
-                    x, y = self._transform_coords(*coords)
-                    raw = {"intent": intent_text, "action_text": action_str}
-                    message = await perform_right_click(
-                        pyautogui,
-                        x,
-                        y,
-                        raw=raw,
-                        config=self._config,
+                # Check for macOS desktop app shortcut dispatch
+                raw = {"intent": intent_text, "action_text": action_str}
+                if should_open_desktop_app_with_shortcut(action_name, raw):
+                    msg = await open_desktop_app_with_shortcut(
+                        pyautogui, sx, sy, raw=raw, config=self._config,
                     )
-                    return True, message
-                return False, f"Cannot parse coordinates: {action_str}"
+                    return True, msg
 
-            if re.match(r"double_click\(", action_str):
-                coords = self._parse_coords(action_str)
-                if coords:
-                    x, y = self._transform_coords(*coords)
-                    raw = {"intent": intent_text, "action_text": action_str}
-                    if should_open_desktop_app_with_shortcut("DOUBLE_CLICK", raw):
-                        message = await open_desktop_app_with_shortcut(
-                            pyautogui,
-                            x,
-                            y,
-                            raw=raw,
-                            config=self._config,
-                        )
-                        return True, message
-                    message = await perform_click_sequence(
-                        pyautogui,
-                        x,
-                        y,
-                        2,
-                        raw=raw,
-                        config=self._config,
-                    )
-                    return True, message
-                return False, f"Cannot parse coordinates: {action_str}"
+                count = resolve_click_count(action_name, raw)
+                msg = await perform_click_sequence(
+                    pyautogui, sx, sy, count, raw=raw, config=self._config,
+                )
+                return True, msg
 
-            if re.match(r"drag\(", action_str):
-                all_coords = re.findall(r"\((\d+)\s*,\s*(\d+)\)", action_str)
-                if not all_coords:
-                    all_coords = re.findall(r"<point>(\d+)\s+(\d+)</point>", action_str)
-                if len(all_coords) >= 2:
-                    x1, y1 = self._transform_coords(
-                        int(all_coords[0][0]), int(all_coords[0][1])
-                    )
-                    x2, y2 = self._transform_coords(
-                        int(all_coords[1][0]), int(all_coords[1][1])
-                    )
-                    raw = {"intent": intent_text, "action_text": action_str}
-                    message = await perform_drag(
-                        pyautogui,
-                        (x1, y1),
-                        (x2, y2),
-                        raw=raw,
-                        config=self._config,
-                    )
-                    return True, message
-                return False, f"Cannot parse drag coordinates: {action_str}"
+            elif action_name == "right_click":
+                start = args.get("start")
+                if not start:
+                    return False, f"Missing start coordinates in: {action_str}"
+                x, y = self._parse_coords(start)
+                sx, sy = self._scale_to_screen(x, y)
+                raw = {"intent": intent_text, "action_text": action_str}
+                msg = await perform_right_click(
+                    pyautogui, sx, sy, raw=raw, config=self._config,
+                )
+                return True, msg
 
-            m = re.match(r'type\((?:content|text)=[\'"](.+?)[\'"]\)', action_str, re.DOTALL)
-            if m:
-                text = m.group(1)
-                if text.isascii():
-                    pyautogui.typewrite(text, interval=0.02)
+            elif action_name == "drag":
+                start = args.get("start")
+                end = args.get("end")
+                if not start or not end:
+                    return False, f"Missing coordinates in: {action_str}"
+                sx, sy = self._parse_coords(start)
+                ex, ey = self._parse_coords(end)
+                sx, sy = self._scale_to_screen(sx, sy)
+                ex, ey = self._scale_to_screen(ex, ey)
+                raw = {"intent": intent_text, "action_text": action_str}
+                msg = await perform_drag(
+                    pyautogui, (sx, sy), (ex, ey), raw=raw, config=self._config,
+                )
+                return True, msg
+
+            elif action_name == "type":
+                content = args.get("content", "")
+                pyautogui.write(content, interval=0.05)
+                return True, f"Typed: {content[:50]}"
+
+            elif action_name == "hotkey":
+                key = args.get("key", "")
+                keys = normalize_hotkey_sequence(key)
+                pyautogui.hotkey(*keys)
+                return True, f"Pressed hotkey: {key}"
+
+            elif action_name == "scroll":
+                start = args.get("start")
+                direction = args.get("direction", "down")
+                amount = int(args.get("amount", "3"))
+                if start:
+                    x, y = self._parse_coords(start)
+                    sx, sy = self._scale_to_screen(x, y)
                 else:
-                    self._type_unicode(text)
-                return True, f"Typed: {text[:50]}..."
+                    sx, sy = pyautogui.position()
+                scroll_amount = amount if direction == "down" else -amount
+                pyautogui.scroll(scroll_amount, x=sx, y=sy)
+                return True, f"Scrolled {direction} by {amount}"
 
-            m = re.match(r'hotkey\((?:key=)?[\'"](.+?)[\'"]\)', action_str)
-            if m:
-                keys = normalize_hotkey_sequence(m.group(1))
-                if len(keys) >= 2:
-                    pyautogui.hotkey(*keys)
-                    return True, f"Pressed: {'+'.join(keys)}"
-                if len(keys) == 1:
-                    pyautogui.press(keys[0])
-                    return True, f"Pressed: {keys[0]}"
-                return False, f"Cannot parse hotkey: {action_str}"
-
-            if re.match(r"scroll\(", action_str):
-                coords = self._parse_coords(action_str)
-                if coords:
-                    x, y = self._transform_coords(*coords)
-                else:
-                    x, y = 0, 0
-                direction_m = re.search(r'direction=[\'"](\w+)[\'"]', action_str)
-                direction = direction_m.group(1) if direction_m else "down"
-                amount_m = re.search(r"amount=(\d+)", action_str)
-                amount = int(amount_m.group(1)) if amount_m else 3
-                clicks = amount if direction == "up" else -amount
-                pyautogui.scroll(clicks, x=x, y=y)
-                return True, f"Scrolled {direction} {amount} at ({x}, {y})"
-
-            m = re.match(r"wait\(seconds=(\d+(?:\.\d+)?)\)", action_str)
-            if m:
+            elif action_name == "wait":
+                seconds = float(args.get("seconds", "2"))
                 import asyncio
-
-                seconds = float(m.group(1))
                 await asyncio.sleep(seconds)
                 return True, f"Waited {seconds}s"
 
-            return False, f"Unknown action: {action_str}"
+            elif action_name in ("call_user", "finished"):
+                # Handled in the main execute loop
+                return True, action_name
+
+            else:
+                return False, f"Unknown action: {action_name}"
 
         except Exception as e:
-            logger.error(f"Action execution error: {e}")
+            logger.error(f"Action execution failed: {e}")
             return False, str(e)
 
-    def _transform_coords(self, x: int, y: int) -> tuple[int, int]:
-        """Transform model coordinates through the unified pipeline."""
-        try:
-            from syll.agent.tools.coordinate_transform import (
-                ActorSpace,
-                ActorType,
-                CoordinateTransformService,
-            )
-
-            workspace = getattr(self._syll_config, 'workspace_path', None)
-            if not workspace:
-                return x, y
-            service = CoordinateTransformService(workspace / "coord_profiles")
-            selected = getattr(self._config, 'selected_screen', 0)
-            ctx = service.get_frame_context(selected)
-            profile = service.load_profile(selected)
-            # Pass model image dimensions so Step 1 reverse-scales from WXGA
-            mw, mh = self._model_img_size
-            actor = ActorSpace(actor_type=ActorType.UI_TARS, api_width=mw, api_height=mh)
-            result = service.model_to_executor(x, y, ctx, actor, profile)
-            return result.executor_x, result.executor_y
-        except Exception as e:
-            logger.debug(f"Coordinate transform fallback (no-op): {e}")
-            return x, y
+    # ----- Argument parsing helpers -----
 
     @staticmethod
-    def _type_unicode(text: str) -> None:
-        """Type unicode text using pyperclip + paste shortcut."""
-        try:
-            import platform
+    def _parse_action_args(args_str: str) -> dict[str, str]:
+        """Parse named arguments from an action string.
 
-            import pyautogui
-            import pyperclip
+        Handles formats like: start='(960, 540)', content='hello', direction="down"
+        """
+        args: dict[str, str] = {}
+        # Single-quoted values
+        for m in re.finditer(r"(\w+)\s*=\s*'([^']*)'", args_str):
+            args[m.group(1)] = m.group(2)
+        # Double-quoted values
+        for m in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', args_str):
+            args[m.group(1)] = m.group(2)
+        return args
 
-            pyperclip.copy(text)
-            if platform.system() == "Darwin":
-                pyautogui.hotkey("command", "v")
-            else:
-                pyautogui.hotkey("ctrl", "v")
-        except ImportError:
-            import pyautogui
+    @staticmethod
+    def _parse_coords(coord_str: str) -> tuple[int, int]:
+        """Parse coordinate string like '(960, 540)' into (x, y)."""
+        match = re.search(r"\((\d+)\s*,\s*(\d+)\)", coord_str)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        raise ValueError(f"Invalid coordinates: {coord_str}")
 
-            # Fallback: type char by char (may not work for all unicode)
-            for ch in text:
-                pyautogui.press(ch) if ch.isascii() else None
+    def _scale_to_screen(self, x: int, y: int) -> tuple[int, int]:
+        """Scale coordinates from model image space to screen space."""
+        model_w, model_h = self._model_img_size
+        if model_w == 0 or model_h == 0:
+            return x, y
+        import pyautogui
+        screen_w, screen_h = pyautogui.size()
+        sx = int(x * screen_w / model_w)
+        sy = int(y * screen_h / model_h)
+        return sx, sy
