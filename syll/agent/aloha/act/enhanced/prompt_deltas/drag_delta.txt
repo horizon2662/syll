@@ -1,0 +1,16 @@
+## Drag Action Guidance
+
+Drag actions require careful identification of both **source** and **destination**:
+- Describe the drag as: "Drag [source element] to [destination element]".
+- Focus on the semantic identity of both elements, NOT pixel coordinates.
+
+Common pitfalls:
+- **Text selection**: Dragging to select text requires precise start/end positions. If text selection fails, try: triple-click to select line, Ctrl+A to select all, or use keyboard Shift+Arrow.
+- **Drop target detection**: The destination must be a valid drop zone. If drag doesn't work, try: copy-paste (Ctrl+C → Ctrl+V) or cut-paste (Ctrl+X → Ctrl+V).
+- **Timing**: Drag operations may require a brief pause after pressing down before moving.
+
+Strategy:
+1. First click/identify the SOURCE element clearly.
+2. Then identify the DESTINATION element.
+3. If drag fails, immediately fall back to keyboard-based alternatives (cut-paste, select all, etc.).
+4. For file operations, consider using keyboard shortcuts or right-click menu instead of drag.

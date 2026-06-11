@@ -1,0 +1,18 @@
+## Type/Input Action Guidance
+
+Before typing, ensure the correct input field is focused:
+- Click the target field first to ensure focus.
+- If the field already contains text, clear it: Ctrl+A (select all) → Delete/Backspace.
+- For non-ASCII text, the system may use clipboard paste (Ctrl+V).
+
+Common pitfalls:
+- Wrong field selected (especially in forms with multiple inputs).
+- Existing text not cleared before typing (append instead of replace).
+- Focus lost due to a popup, loading indicator, or auto-suggestion overlay.
+
+Strategy:
+1. Click the target field.
+2. Verify the field is focused (cursor visible, field highlighted).
+3. Clear existing content if needed (Ctrl+A → Delete).
+4. Type the new text.
+5. Confirm the text was entered correctly.
