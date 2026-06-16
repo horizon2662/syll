@@ -22,7 +22,7 @@ loop the first skeleton left open:
 
 Run::
 
-    python -m refactor_skeleton.runner "research X and write a report" --skill research
+    python -m syll.agent.longhorizon.runner "research X and write a report" --skill research
 """
 
 from __future__ import annotations
@@ -383,7 +383,7 @@ def _main() -> int:
             "SYLL_MODEL / SYLL_API_BASE. Example:\n"
             "  export SYLL_API_KEY=...\n"
             "  export SYLL_MODEL=glm-4.6\n"
-            "  python -m refactor_skeleton.runner 'task' --skill research",
+            "  python -m syll.agent.longhorizon.runner 'task' --skill research",
             file=sys.stderr,
         )
         return 2

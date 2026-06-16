@@ -8,7 +8,7 @@ modifying site-packages.
 
 Run::
 
-    python -m refactor_skeleton.runner "your task here"
+    python -m syll.agent.longhorizon.runner "your task here"
 """
 
 from .contract import SubagentContract, SubagentResult

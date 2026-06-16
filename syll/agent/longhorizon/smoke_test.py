@@ -4,7 +4,7 @@ No API key needed. Verifies the stateful logic the runner depends on:
 plan creation, subagent fold, per-skill + global memory writes,
 checkpoint/resume, and replan (align).
 
-Run:  python -m refactor_skeleton.smoke_test
+Run:  python -m syll.agent.longhorizon.smoke_test
 """
 
 from __future__ import annotations
