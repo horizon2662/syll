@@ -152,6 +152,9 @@ class UnifiedSubagentManager:
         restrict_to_workspace: bool = False,
         mcp_manager: "MCPManager | None" = None,
         max_iterations: int = 15,
+        gui_config: Any = None,
+        syll_config: Any = None,
+        event_store: Any = None,
     ):
         from syll.config.schema import ExecToolConfig
 
@@ -164,6 +167,11 @@ class UnifiedSubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self.mcp_manager = mcp_manager
         self.max_iterations = max_iterations
+        # GUI + app config so subagents can operate the desktop (reuses the
+        # ghost's v2 GUI stack) and resolve model endpoints for planner/actor.
+        self.gui_config = gui_config
+        self.syll_config = syll_config
+        self.event_store = event_store
         self._running: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
@@ -405,6 +413,46 @@ class UnifiedSubagentManager:
             for adapter in self.mcp_manager.iter_propagating_tools():
                 if not tools.has(adapter.name):
                     tools.register(adapter)
+
+        # GUI tools — reuse the ghost's v2 GUI stack verbatim (screenshot +
+        # UI-TARS single-shot + Enhanced Planner/Actor TVAE loop). Gated on
+        # gui_config.enabled, exactly like AgentLoop._register_default_tools.
+        if self.gui_config is not None and getattr(self.gui_config, "enabled", False):
+            from syll.agent.aloha_gui_skill import AlohaSkillStore
+            from syll.agent.gui_skill import GUISkillStore
+            from syll.agent.tools.screenshot import ScreenshotTool
+            from syll.agent.tools.ui_tars import UITarsTool
+
+            gui_skill_store = GUISkillStore(self.workspace)
+            aloha_skill_store = AlohaSkillStore(self.workspace)
+            tools.register(ScreenshotTool())
+
+            ui_tars_tool = UITarsTool(
+                self.gui_config,
+                gui_skill_store=gui_skill_store,
+                aloha_skill_store=aloha_skill_store,
+                syll_config=self.syll_config,
+            )
+            if self.event_store is not None:
+                ui_tars_tool._event_store = self.event_store
+            tools.register(ui_tars_tool)
+
+            try:
+                from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
+                    EnhancedAlohaPlannerTool,
+                )
+                planner_tool = EnhancedAlohaPlannerTool(
+                    self.gui_config, aloha_skill_store, syll_config=self.syll_config
+                )
+            except ImportError:
+                from syll.agent.tools.aloha_planner_tool import AlohaPlannerTool
+                planner_tool = AlohaPlannerTool(
+                    self.gui_config, aloha_skill_store, syll_config=self.syll_config
+                )
+            if self.event_store is not None:
+                planner_tool._event_store = self.event_store
+            tools.register(planner_tool)
+
         return tools
 
     def _build_prompt(self, contract: SubagentContract, skill_ctx: str) -> str:

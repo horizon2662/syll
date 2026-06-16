@@ -86,12 +86,34 @@ class Runner:
         ws.mkdir(parents=True, exist_ok=True)
 
         self.bus = MessageBus()
+
+        # Load the syll Config (~/.syll/config.json) so subagents get the SAME
+        # GUI stack + model endpoints the ghost uses — reusing v2's setup verbatim.
+        from syll.config.loader import load_config
+
+        try:
+            syll_cfg = load_config()
+        except Exception:
+            syll_cfg = None
+        gui_cfg = syll_cfg.tools.gui if syll_cfg is not None else None
+
+        # Optional event store for the GUI tools (None is fine — they degrade).
+        try:
+            from syll.agent.events import EventStore
+
+            event_store = EventStore(ws.parent)
+        except Exception:
+            event_store = None
+
         self.subagents = UnifiedSubagentManager(
             provider=provider,
             workspace=ws,
             bus=self.bus,
             model=cfg.model,
             max_iterations=cfg.max_subagent_iterations,
+            gui_config=gui_cfg,
+            syll_config=syll_cfg,
+            event_store=event_store,
         )
         self.hpm = HierarchicalPlanManager(ws, cfg.skill)
         self.skill_mem = SkillMemory(ws, cfg.skill)
