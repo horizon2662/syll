@@ -1,6 +1,5 @@
 """Memory system for persistent agent memory."""
 
-from datetime import datetime
 from pathlib import Path
 
 from syll.utils.helpers import ensure_dir, today_date
@@ -52,32 +51,6 @@ class MemoryStore:
     def write_long_term(self, content: str) -> None:
         """Write to long-term memory (MEMORY.md)."""
         self.memory_file.write_text(content, encoding="utf-8")
-
-    def get_recent_memories(self, days: int = 7) -> str:
-        """
-        Get memories from the last N days.
-
-        Args:
-            days: Number of days to look back.
-
-        Returns:
-            Combined memory content.
-        """
-        from datetime import timedelta
-
-        memories = []
-        today = datetime.now().date()
-
-        for i in range(days):
-            date = today - timedelta(days=i)
-            date_str = date.strftime("%Y-%m-%d")
-            file_path = self.memory_dir / f"{date_str}.md"
-
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                memories.append(content)
-
-        return "\n\n---\n\n".join(memories)
 
     def list_memory_files(self) -> list[Path]:
         """List all memory files sorted by date (newest first)."""

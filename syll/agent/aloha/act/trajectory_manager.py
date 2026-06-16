@@ -1,25 +1,17 @@
-"""Trajectory manager: loads and formats trajectory data for planner context.
+"""Trajectory manager: formats trajectory data for planner context.
 
 Adapted from ShowUI-Aloha/Aloha_Act/ui_aloha/act/gui_agent/planner/trajectory_manager.py.
 """
-
-import json
-from pathlib import Path
-
-from loguru import logger
 
 
 class TrajectoryManager:
     """Manages trajectory data for task guidance."""
 
     def get_full_trace(self, trajectory: list[dict] | dict | None) -> dict | None:
-        """Load trace data from a dict, list, or file path.
+        """Normalize trace data from a dict, list, or None.
 
         Args:
-            trajectory: Can be:
-                - A dict with "trajectory" key
-                - A list of step dicts
-                - None
+            trajectory: A dict with "trajectory" key, a list of step dicts, or None.
 
         Returns:
             Dict with "trajectory" key, or None.
@@ -66,15 +58,3 @@ class TrajectoryManager:
         if formatting_string:
             return "\n".join(context_steps)
         return context_steps
-
-    def load_trajectory_file(self, path: str | Path) -> dict | None:
-        """Load trajectory from a JSON file."""
-        path = Path(path)
-        if not path.exists():
-            logger.warning(f"Trajectory file not found: {path}")
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"Failed to load trajectory from {path}: {e}")
-            return None
