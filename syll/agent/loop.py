@@ -331,6 +331,32 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
+        # Auto-route GUI/desktop tasks to the v3 (longhorizon) pipeline so they
+        # get fold + subagent + verification gate + checkpoint/replan instead of
+        # a single-shot GUI action. Gated on gui_config.enabled; any failure
+        # falls through to the normal flow, so the ghost never breaks here.
+        if self.gui_config and getattr(self.gui_config, "enabled", False):
+            try:
+                from syll.agent.longhorizon.router import is_gui_task, run_gui_via_v3
+
+                _task_text = (prompt_content or msg.content or "").strip()
+                if _task_text and await is_gui_task(self.provider, _task_text, model=self.model):
+                    logger.info("Auto-routing GUI task -> v3 (longhorizon) pipeline")
+                    _v3_ws = self.workspace / "longhorizon_runs" / msg.session_key.replace(":", "_")
+                    _summary = await run_gui_via_v3(
+                        _task_text,
+                        workspace=_v3_ws,
+                        provider=self.provider,
+                        model=self.model,
+                    )
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"[via v3 pipeline]\n{_summary}",
+                    )
+            except Exception as _e:
+                logger.warning(f"v3 GUI routing failed, falling back to normal flow: {_e}")
+
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
 
         # Get or create session
