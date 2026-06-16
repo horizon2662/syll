@@ -1,0 +1,16 @@
+## Scroll Action Guidance
+
+Scrolling should be done in **small, deliberate increments**:
+- Specify direction (up/down) and approximate distance.
+- After scrolling, re-observe the screen to verify the target content is visible.
+
+Common pitfalls:
+- Overshooting: scrolling too far past the target.
+- Undershooting: not scrolling enough to reveal the target.
+- Dynamic content: infinite scroll pages may keep loading.
+
+Strategy:
+1. Scroll a small amount (2-3 "clicks").
+2. Take a new observation.
+3. If the target is not yet visible, scroll again.
+4. If the target was missed, scroll back in the opposite direction.

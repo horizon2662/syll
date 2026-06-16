@@ -1,0 +1,16 @@
+## Click Action Guidance
+
+Focus on identifying the **exact target element**:
+- Look for unique visual features: text label, icon shape, position relative to other elements.
+- If multiple similar icons exist (e.g., toolbars in PS/VS Code), identify the target by its **neighboring elements** or **tooltip text**.
+- Verify the element is not occluded by a dialog, overlay, or tooltip.
+
+Common pitfalls:
+- Visually similar icons in dense toolbars (e.g., Save vs Save As).
+- Overlapping elements or hidden menus that need to be expanded first.
+- Elements that require scrolling to become visible.
+
+Strategy:
+1. Describe the target by its unique characteristics.
+2. Note its approximate position (e.g., "top menu bar, second item from left").
+3. If a previous click on this target failed, try an alternative: keyboard shortcut, right-click menu, or click a parent container first.
