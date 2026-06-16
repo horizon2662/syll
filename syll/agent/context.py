@@ -28,6 +28,11 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
         self.identity = identity or IdentityConfig()
+        # Lazily-built, reused across turns (avoids re-instantiating the skill
+        # stores on every system-prompt build). Stores are stateless — they read
+        # disk on each call — so a single cached instance is correct and current.
+        self._gui_store = None
+        self._aloha_store = None
 
     def _substitute_vars(self, text: str) -> str:
         """Replace {{ghost_name}} and {{user_name}} placeholders with config values.
@@ -243,10 +248,14 @@ When a skill (SKILL.md) is relevant to the current task:
 
     def _build_gui_skills_section(self) -> str:
         """Build system prompt section listing available GUI demonstration skills."""
-        from syll.agent.gui_skill import GUISkillStore
+        if self._gui_store is None:
+            from syll.agent.gui_skill import GUISkillStore
+            self._gui_store = GUISkillStore(self.workspace)
+        if self._aloha_store is None:
+            from syll.agent.aloha_gui_skill import AlohaSkillStore
+            self._aloha_store = AlohaSkillStore(self.workspace)
 
-        store = GUISkillStore(self.workspace)
-        gui_skills = store.list_gui_skills()
+        gui_skills = self._gui_store.list_gui_skills()
 
         lines: list[str] = []
         if gui_skills:
@@ -263,9 +272,7 @@ When a skill (SKILL.md) is relevant to the current task:
 
         # Append Aloha skills
         try:
-            from syll.agent.aloha_gui_skill import AlohaSkillStore
-            aloha_store = AlohaSkillStore(self.workspace)
-            aloha_skills = aloha_store.list_skills()
+            aloha_skills = self._aloha_store.list_skills()
         except Exception:
             aloha_skills = []
 
