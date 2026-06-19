@@ -456,10 +456,35 @@ class UnifiedSubagentManager:
         return tools
 
     def _build_prompt(self, contract: SubagentContract, skill_ctx: str) -> str:
+        import platform
+
+        # GUI delegation: when GUI tools are available, the subagent must DRIVE
+        # the UI through `gui_action_planned` (which grounds via the vision
+        # actor + verifies), NOT via shell/SendKeys or by eyeballing a
+        # screenshot. Shell stays for non-GUI work only.
+        gui_block = ""
+        if self.gui_config is not None and getattr(self.gui_config, "enabled", False):
+            gui_block = """
+## GUI / desktop operations (IMPORTANT)
+- To operate ANY graphical UI — open apps, click, type into windows, menus,
+  draw shapes, navigate tabs — call `gui_action_planned(instruction="<what>")`.
+  It captures the screen, grounds via a VISION actor, performs the action, and
+  verifies it. This is the ONLY correct way to drive the GUI.
+- DO NOT use exec/shell/PowerShell/SendKeys/osascript to manipulate windows.
+- DO NOT take a screenshot and guess coordinates — you cannot see the image;
+  the GUI tool sees it for you.
+- Use exec/shell ONLY for non-GUI work (run scripts, install deps, file ops).
+"""
+
         return f"""# Subagent (isolated context)
 
 You operate with your OWN context window; the main agent never sees your
 intermediate steps.
+
+## Environment
+Platform: {platform.system()} {platform.release()} ({platform.machine()}).
+Use platform-appropriate commands only — never macOS-only commands (e.g.
+`osascript`) on Windows, or Windows-only commands on macOS.
 
 ## Hard rules (do not violate)
 1. DO THE WORK FIRST. Use tools to actually perform the task BEFORE calling
@@ -469,10 +494,10 @@ intermediate steps.
 2. Write files using ABSOLUTE paths under the workspace below. Relative paths
    resolve unpredictably; always prefix with the workspace path shown here.
 3. Your `return.summary` must state what you ACTUALLY did (commands run, files
-   read/written), not a plausible-sounding guess. If you could not complete the
-   task, return status="failed" with a diagnosis -- do not pretend.
+   read/written, GUI actions performed via gui_action_planned), not a plausible
+   guess. If you could not complete the task, return status="failed" + diagnosis.
 4. Stay strictly within the assigned task -- do not branch or take side tasks.
-
+{gui_block}
 {skill_ctx}
 
 ## Workspace (write all files under here, using absolute paths)
