@@ -262,7 +262,7 @@ class Runner:
     # main-brain LLM calls (decision points)
     # ------------------------------------------------------------------
     async def _propose_milestones(self, task: str) -> list[tuple[str, list[str]]]:
-        prompt = (
+        base_prompt = (
             "You are a planner. Break the task into 2-4 milestones, each with "
             "1-3 steps. Each step MUST be a concrete, directly-executable action "
             "(e.g. 'run: ls <dir>', 'read file <path>', 'write <content> to "
@@ -272,22 +272,39 @@ class Runner:
             f"Skill memory so far:\n{self.skill_mem.get_relevant(task)[:1500] or '(none)'}\n\n"
             f"Task: {task}"
         )
-        resp = await self.provider.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model=self.cfg.model,
-            max_tokens=1500,
-            temperature=0.3,
-        )
-        data = _extract_json(resp.content or "")
+        prompt = base_prompt
         out: list[tuple[str, list[str]]] = []
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    title = str(item.get("title", "milestone"))
-                    steps = [str(s) for s in item.get("steps", []) if s]
-                    if steps:
-                        out.append((title, steps))
-        return out
+        for _attempt in range(3):
+            try:
+                resp = await self.provider.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self.cfg.model,
+                    max_tokens=1500,
+                    temperature=0.3,
+                )
+                data = _extract_json((resp.content if resp else None) or "")
+            except Exception:
+                data = None
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        title = str(item.get("title", "milestone"))
+                        steps = [str(s) for s in item.get("steps", []) if s]
+                        if steps:
+                            out.append((title, steps))
+            if out:
+                return out
+            # Retry with a sterner "JSON only" instruction.
+            prompt = base_prompt + (
+                "\n\nIMPORTANT: reply with ONLY the JSON array — no prose, "
+                "no code fence, no explanation."
+            )
+        # Fallback so a transient bad LLM response never aborts the whole run.
+        logger.warning(
+            "planner produced no usable plan after retries; "
+            "falling back to task-as-single-milestone"
+        )
+        return [(task or "task", [task] if task else [])]
 
     async def _propose_replan(self, step_desc: str, diagnosis: str) -> list[str]:
         prompt = (
