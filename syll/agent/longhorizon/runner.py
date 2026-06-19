@@ -96,6 +96,7 @@ class Runner:
         except Exception:
             syll_cfg = None
         gui_cfg = syll_cfg.tools.gui if syll_cfg is not None else None
+        self._gui_enabled = gui_cfg is not None and getattr(gui_cfg, "enabled", False)
 
         # Optional event store for the GUI tools (None is fine — they degrade).
         try:
@@ -262,14 +263,27 @@ class Runner:
     # main-brain LLM calls (decision points)
     # ------------------------------------------------------------------
     async def _propose_milestones(self, task: str) -> list[tuple[str, list[str]]]:
+        gui_clause = (
+            "\n\nGUI RULE: if a step requires operating a graphical/desktop app "
+            "(opening apps, clicking, typing into windows, drawing shapes, "
+            "navigating menus/tabs), express it as ONE gui_action_planned step "
+            "with a visual instruction (e.g. 'gui_action_planned: click the "
+            "Shapes button on the Insert tab and draw a rectangle on the "
+            "slide'). DO NOT script GUI work with shell/PowerShell/COM/SendKeys "
+            "— that bypasses the vision actor and is forbidden. Reserve "
+            "exec/shell for non-GUI work (scripts, deps, files)."
+            if self._gui_enabled
+            else ""
+        )
         base_prompt = (
             "You are a planner. Break the task into 2-4 milestones, each with "
             "1-3 steps. Each step MUST be a concrete, directly-executable action "
             "(e.g. 'run: ls <dir>', 'read file <path>', 'write <content> to "
-            "<path>'), NOT a vague goal like 'navigate', 'analyze', or "
-            "'understand'. Respond ONLY with JSON: an array of objects "
-            "{\"title\": str, \"steps\": [str]}.\n\n"
-            f"Skill memory so far:\n{self.skill_mem.get_relevant(task)[:1500] or '(none)'}\n\n"
+            "<path>', or for GUI: 'gui_action_planned: <visual goal>'), NOT a "
+            "vague goal like 'navigate', 'analyze', or 'understand'. Respond "
+            "ONLY with JSON: an array of objects {\"title\": str, \"steps\": [str]}."
+            + gui_clause
+            + f"\n\nSkill memory so far:\n{self.skill_mem.get_relevant(task)[:1500] or '(none)'}\n\n"
             f"Task: {task}"
         )
         prompt = base_prompt
