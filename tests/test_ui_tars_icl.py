@@ -16,6 +16,7 @@ from syll.agent.aloha_gui_skill import (
     AlohaTrace,
 )
 from syll.agent.tools.ui_tars import Conversation, UITarsTool
+from syll.sandbox.environment import LocalEnvironment
 
 
 @pytest.fixture
@@ -118,24 +119,26 @@ async def test_call_uitars_uses_conversation_image_mime(tmp_path):
     tool, _ = _make_tool(tmp_path)
     captured: dict = {}
 
-    async def fake_acompletion(**kwargs):
+    async def fake_chat(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Action: finished(content='done')"))]
-        )
+        return SimpleNamespace(content="Action: finished(content='done')")
 
-    with patch.dict(sys.modules, {"litellm": SimpleNamespace(acompletion=fake_acompletion)}):
-        await tool._call_uitars(
-            "Launch Stardew Valley",
-            [
-                Conversation(
-                    role="user",
-                    screenshot_b64="ZmFrZS1qcGVn",
-                    screenshot_mime="image/jpeg",
-                    is_icl=True,
-                )
-            ],
-        )
+    # _call_uitars routes through the shared LLMProvider (0b unification), not
+    # litellm directly — inject a provider mock so the call runs and we can
+    # inspect the outbound payload.
+    tool._actor_provider = SimpleNamespace(chat=fake_chat)
+
+    await tool._call_uitars(
+        "Launch Stardew Valley",
+        [
+            Conversation(
+                role="user",
+                screenshot_b64="ZmFrZS1qcGVn",
+                screenshot_mime="image/jpeg",
+                is_icl=True,
+            )
+        ],
+    )
 
     image_url = captured["messages"][2]["content"][0]["image_url"]["url"]
     assert image_url == "data:image/jpeg;base64,ZmFrZS1qcGVn"
@@ -151,8 +154,11 @@ async def test_execute_action_uses_mac_mouse_backend_fallback(tmp_path):
         mac_click_style="auto",
         preflight_permissions=True,
     )
-    tool = UITarsTool(config)
+    tool = UITarsTool(config, environment=LocalEnvironment(os_type="darwin"))
     pyautogui = MagicMock()
+    # _scale_to_screen falls back to pyautogui.size() when mss is unavailable;
+    # a bare MagicMock yields nothing to unpack, so configure a real screen size.
+    pyautogui.size.return_value = (1920, 1080)
 
     with patch.dict(sys.modules, {"pyautogui": pyautogui}), patch(
         "syll.agent.gui_click.asyncio.sleep", new=AsyncMock()
@@ -182,12 +188,10 @@ async def test_execute_hotkey_normalizes_cmd_alias_on_macos(tmp_path):
         mac_click_style="auto",
         preflight_permissions=True,
     )
-    tool = UITarsTool(config)
+    tool = UITarsTool(config, environment=LocalEnvironment(os_type="darwin"))
     pyautogui = MagicMock()
 
-    with patch.dict(sys.modules, {"pyautogui": pyautogui}), patch(
-        "syll.agent.gui_click.platform.system", return_value="Darwin"
-    ):
+    with patch.dict(sys.modules, {"pyautogui": pyautogui}):
         success, message = await tool._execute_action("hotkey(key='cmd+h')", "Hide the current window")
 
     assert success is True

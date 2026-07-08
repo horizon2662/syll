@@ -1,7 +1,6 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -9,24 +8,25 @@ from loguru import logger
 
 from syll.agent.context import ContextBuilder
 from syll.agent.events import Event, EventContent, EventSource, EventStore
+from syll.agent.memory import GlobalMemoryStore, MemoryStore, migrate_workspace_memory_to_global
+from syll.agent.context_compactor import ContextCompactor
+from syll.agent.memory_flush import MemoryFlusher
 from syll.agent.result import AgentResult
 from syll.agent.subagent import SubagentManager
+from syll.sandbox.environment import LocalEnvironment
 
 if TYPE_CHECKING:
     from syll.agent.mcp import MCPManager
 from syll.agent.tools.attach_file import AttachFileTool
-from syll.agent.tools.base import ToolResult
+from syll.agent.tools.bundles import register_core_tools
 from syll.agent.tools.cron import CronTool
 from syll.agent.tools.file_preview import FilePreviewTool
-from syll.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from syll.agent.tools.find_file import FindFileTool
 from syll.agent.tools.message import MessageTool
 from syll.agent.tools.registry import ToolRegistry
 from syll.agent.tools.screenshot import ScreenshotTool
-from syll.agent.tools.shell import ExecTool
 from syll.agent.tools.spawn import SpawnTool
 from syll.agent.tools.video_learn import VideoLearnTool
-from syll.agent.tools.web import WebFetchTool, WebSearchTool
 from syll.bus.events import InboundMessage, OutboundMessage
 from syll.bus.queue import MessageBus
 from syll.providers.base import LLMProvider
@@ -59,6 +59,7 @@ class AgentLoop:
         gui_config: "GuiConfig | None" = None,
         syll_config: "Config | None" = None,
         mcp_manager: "MCPManager | None" = None,
+        global_memory_store: "MemoryStore | None" = None,
     ):
         from syll.config.schema import ExecToolConfig
         self.bus = bus
@@ -75,8 +76,22 @@ class AgentLoop:
         self.mcp_manager = mcp_manager
 
         identity = syll_config.identity if syll_config else None
-        self.context = ContextBuilder(workspace, identity=identity)
+        global_memory = global_memory_store or GlobalMemoryStore()
+        self.context = ContextBuilder(
+            workspace, global_memory=global_memory, identity=identity
+        )
+        self.memory_flusher = MemoryFlusher(self.provider, self.context.memory, model=self.model)
+        self.context_compactor = ContextCompactor(self.provider, self.model)
+
+        # One-time migration of existing workspace MEMORY.md to the new global
+        # user memory store. Safe to call on every startup: it only runs when
+        # global MEMORY.md is missing and workspace memory has real content.
+        try:
+            migrate_workspace_memory_to_global(workspace)
+        except Exception:
+            pass
         self.sessions = SessionManager(workspace)
+        self.environment = LocalEnvironment(workspace_root=workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -87,6 +102,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             mcp_manager=mcp_manager,
+            environment=self.environment,
         )
         self.event_store = EventStore(workspace.parent)
 
@@ -96,8 +112,46 @@ class AgentLoop:
         # tools whose names happen to start with "mcp__".
         self._mcp_owned: set[str] = set()
 
+        # Per-session ContextMeter cache. Keyed by session_key so the token
+        # curve accumulates ACROSS turns (history grows across turns too —
+        # that is part of what fills the context). One meter appends to one
+        # {workspace}/audit/{session}/context_curve.jsonl.
+        self._ctx_meters: dict = {}
+
         self._running = False
         self._register_default_tools()
+
+    def get_context_meter(self, session_key: str):
+        """Get or create the per-session ContextMeter.
+
+        Shared by ``_process_message`` (non-streaming chat / process_direct)
+        AND the WebSocket streaming path (``web/streaming.py``) so both append
+        to ONE curve file per session. Returns None if creation fails.
+        """
+        meter = self._ctx_meters.get(session_key)
+        if meter is not None:
+            return meter
+        try:
+            from syll.agent.longhorizon.context_meter import (
+                ContextMeter,
+                resolve_context_window,
+            )
+            _cw = 0
+            if self.syll_config:
+                try:
+                    _cw = self.syll_config.models.chat.context_window
+                except Exception:
+                    _cw = 0
+            meter = ContextMeter(
+                run_dir=self.workspace / "audit" / session_key.replace(":", "_"),
+                run_id=session_key,
+                budget_tokens=resolve_context_window(self.model, _cw),
+            )
+            self._ctx_meters[session_key] = meter
+        except Exception as _e:
+            logger.debug(f"context meter disabled for {session_key}: {_e}")
+            meter = None
+        return meter
 
     def reload_mcp_tools(self) -> int:
         """(Re)register MCP tools on `self.tools` from the manager.
@@ -140,46 +194,36 @@ class AgentLoop:
         return registered
 
     def _register_default_tools(self) -> None:
-        """Register the default set of tools."""
-        # File tools (restrict to workspace if configured)
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        self.tools.register(ReadFileTool(allowed_dir=allowed_dir))
-        self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
-        self.tools.register(EditFileTool(allowed_dir=allowed_dir))
-        self.tools.register(ListDirTool(allowed_dir=allowed_dir))
-
-        # Shell tool
-        self.tools.register(ExecTool(
-            working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
+        """Register the default tool set, grouped by category."""
+        # File + shell + web tools (shared core). The loop additionally exposes
+        # EditFileTool; subagents get read/write/list only.
+        register_core_tools(
+            self.tools,
+            workspace=self.workspace,
             restrict_to_workspace=self.restrict_to_workspace,
-        ))
+            exec_config=self.exec_config,
+            brave_api_key=self.brave_api_key,
+            include_edit=True,
+            environment=self.environment,
+        )
+        self._register_interactive_tools()
+        self._register_video_tool()
+        self._register_voice_tool()
+        self._register_gui_tools()
 
-        # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
-        self.tools.register(WebFetchTool())
-
-        # Message tool
-        message_tool = MessageTool(send_callback=self.bus.publish_outbound)
-        self.tools.register(message_tool)
-
-        # Spawn tool (for subagents)
-        spawn_tool = SpawnTool(manager=self.subagents)
-        self.tools.register(spawn_tool)
-
-        # Cron tool (for scheduling)
+    def _register_interactive_tools(self) -> None:
+        """Message / spawn / cron / screenshot / file-discovery tools."""
+        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-
-        # Screenshot tool (always available)
-        self.tools.register(ScreenshotTool())
-
-        # File discovery / preview / attach (Demo 3 mobile → desktop file flow)
+        self.tools.register(ScreenshotTool(environment=self.environment))
         self.tools.register(FindFileTool())
         self.tools.register(FilePreviewTool())
         self.tools.register(AttachFileTool())
 
-        # Video learning tool — requires yt-dlp on PATH
+    def _register_video_tool(self) -> None:
+        """Video-learning tool — registered only when yt-dlp is on PATH."""
         try:
             import shutil as _shutil
             if _shutil.which("yt-dlp"):
@@ -203,78 +247,110 @@ class AgentLoop:
         except Exception as e:
             logger.debug(f"VideoLearnTool registration skipped: {e}")
 
-        # Voice tool — only if TTS credentials are configured. Without
-        # this guard the tool would surface in the LLM prompt even when
-        # ``speak`` would immediately fail, wasting a turn.
-        if (
+    def _register_voice_tool(self) -> None:
+        """Speak tool — only when TTS credentials are configured.
+
+        Without this guard the tool would surface in the LLM prompt even when
+        ``speak`` would immediately fail, wasting a turn."""
+        if not (
             self.syll_config
             and getattr(self.syll_config, "voice", None)
             and self.syll_config.voice.enabled
             and self.syll_config.voice.tts.appid
             and self.syll_config.voice.tts.access_token
         ):
-            try:
-                from syll.agent.tools.speak import SpeakTool
-                from syll.providers.voice_volc import VolcengineTTSProvider
-                tts_cfg = self.syll_config.voice.tts
-                # Default resource_id is used ONLY as the fallback for
-                # unknown voices; the builtin voice→resource_id catalog
-                # covers both BigTTS 2.0 and Seed-TTS 2.0. We align the
-                # fallback with the configured default_speaker so the
-                # "empty resource_id + common voice" combination Just Works.
-                tts = VolcengineTTSProvider(
-                    appid=tts_cfg.appid,
-                    access_token=tts_cfg.access_token,
-                    default_speaker=self.syll_config.voice.default_speaker,
-                    resource_id=tts_cfg.resource_id or "seed-tts-2.0",
-                    voice_resources=getattr(tts_cfg, "voice_resources", None) or None,
-                )
-                self.tools.register(SpeakTool(tts))
-                logger.info("SpeakTool registered (voice.tts.provider=volcengine)")
-            except Exception as e:
-                logger.warning(f"SpeakTool registration failed: {e}")
+            return
+        try:
+            from syll.agent.tools.speak import SpeakTool
+            from syll.providers.voice_volc import VolcengineTTSProvider
+            tts_cfg = self.syll_config.voice.tts
+            # Default resource_id is used ONLY as the fallback for
+            # unknown voices; the builtin voice→resource_id catalog
+            # covers both BigTTS 2.0 and Seed-TTS 2.0. We align the
+            # fallback with the configured default_speaker so the
+            # "empty resource_id + common voice" combination Just Works.
+            tts = VolcengineTTSProvider(
+                appid=tts_cfg.appid,
+                access_token=tts_cfg.access_token,
+                default_speaker=self.syll_config.voice.default_speaker,
+                resource_id=tts_cfg.resource_id or "seed-tts-2.0",
+                voice_resources=getattr(tts_cfg, "voice_resources", None) or None,
+            )
+            self.tools.register(SpeakTool(tts))
+            logger.info("SpeakTool registered (voice.tts.provider=volcengine)")
+        except Exception as e:
+            logger.warning(f"SpeakTool registration failed: {e}")
 
-        # GUI tool (for UI automation via UI-TARS)
-        if self.gui_config and self.gui_config.enabled:
-            from syll.agent.aloha_gui_skill import AlohaSkillStore
+    def _register_gui_tools(self) -> None:
+        """Register the GUI tools, gated on gui_config.enabled.
+
+        ``gui_action`` runs the Enhanced TVAE-verifier pipeline
+        (``GuiActionTool``) so ad-hoc tasks get per-step verification; it falls
+        back to ``UITarsTool`` only if the enhanced module is unavailable.
+        ``gui_action_planned`` is the explicit trajectory-guided variant
+        (skill_name required)."""
+        if not (self.gui_config and self.gui_config.enabled):
+            return
+        from syll.agent.aloha_gui_skill import AlohaSkillStore
+
+        aloha_skill_store = AlohaSkillStore(self.workspace)
+
+        # gui_action → Enhanced verifier pipeline (skill optional). Per the
+        # user directive, ALL gui_action calls go through gui_action_planned's
+        # TVAE verifier, not the verifier-less UITarsTool.
+        try:
+            from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
+                GuiActionTool,
+            )
+
+            gui_action_tool = GuiActionTool(
+                self.gui_config, aloha_skill_store, syll_config=self.syll_config,
+                environment=self.environment,
+            )
+            logger.info("Using GuiActionTool (Enhanced TVAE verifier) for gui_action")
+        except ImportError:
             from syll.agent.gui_skill import GUISkillStore
             from syll.agent.tools.ui_tars import UITarsTool
 
             gui_skill_store = GUISkillStore(self.workspace)
-            aloha_skill_store = AlohaSkillStore(self.workspace)
-            ui_tars_tool = UITarsTool(
+            gui_action_tool = UITarsTool(
                 self.gui_config,
                 gui_skill_store=gui_skill_store,
                 aloha_skill_store=aloha_skill_store,
                 syll_config=self.syll_config,
+                environment=self.environment,
             )
-            ui_tars_tool._event_store = self.event_store
-            self.tools.register(ui_tars_tool)
+            logger.warning("Enhanced unavailable; falling back to UITarsTool for gui_action")
 
-            # Planner+Actor tool for Aloha skills (enhanced when available)
-            try:
-                from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
-                    EnhancedAlohaPlannerTool,
-                )
+        gui_action_tool._event_store = self.event_store
+        self.tools.register(gui_action_tool)
 
-                planner_tool = EnhancedAlohaPlannerTool(
-                    self.gui_config,
-                    aloha_skill_store,
-                    syll_config=self.syll_config,
-                )
-                logger.info("Using EnhancedAlohaPlannerTool (Phase 1-4 enabled)")
-            except ImportError:
-                from syll.agent.tools.aloha_planner_tool import AlohaPlannerTool
+        # gui_action_planned: explicit trajectory-guided variant (skill required)
+        try:
+            from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
+                EnhancedAlohaPlannerTool,
+            )
 
-                planner_tool = AlohaPlannerTool(
-                    self.gui_config,
-                    aloha_skill_store,
-                    syll_config=self.syll_config,
-                )
-                logger.info("Using original AlohaPlannerTool (enhanced unavailable)")
+            planner_tool = EnhancedAlohaPlannerTool(
+                self.gui_config,
+                aloha_skill_store,
+                syll_config=self.syll_config,
+                environment=self.environment,
+            )
+            logger.info("Using EnhancedAlohaPlannerTool (Phase 1-4 enabled)")
+        except ImportError:
+            from syll.agent.tools.aloha_planner_tool import AlohaPlannerTool
 
-            planner_tool._event_store = self.event_store
-            self.tools.register(planner_tool)
+            planner_tool = AlohaPlannerTool(
+                self.gui_config,
+                aloha_skill_store,
+                syll_config=self.syll_config,
+                environment=self.environment,
+            )
+            logger.info("Using original AlohaPlannerTool (enhanced unavailable)")
+
+        planner_tool._event_store = self.event_store
+        self.tools.register(planner_tool)
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -317,65 +393,34 @@ class AgentLoop:
         prompt_content: str | None = None,
         language_hint_text: str | None = None,
     ) -> OutboundMessage | None:
-        """
-        Process a single inbound message.
+        """Process a single inbound message through the tool-calling loop.
 
-        Args:
-            msg: The inbound message to process.
-
-        Returns:
-            The response message, or None if no response needed.
+        Returns the response message, or None if no response is needed.
         """
-        # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
-        # Auto-route GUI/desktop tasks to the v3 (longhorizon) pipeline so they
-        # get fold + subagent + verification gate + checkpoint/replan instead of
-        # a single-shot GUI action. Gated on gui_config.enabled; any failure
-        # falls through to the normal flow, so the ghost never breaks here.
-        if self.gui_config and getattr(self.gui_config, "enabled", False):
-            try:
-                from syll.agent.longhorizon.router import is_gui_task, run_gui_via_v3
+        # /retry-gui: clear this session's GUI failure locks so the model can
+        # retry gui_action after a (possibly transient) failure was recorded.
+        if (msg.content or "").strip().lower() == "/retry-gui":
+            from syll.agent.gui_failure_ledger import GuiAttemptLedger
+            cleared = GuiAttemptLedger(msg.session_key).clear_all()
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    f"已清除本会话的 {cleared} 个 GUI 失败锁，可以重试 gui_action。"
+                ),
+            )
 
-                _task_text = (prompt_content or msg.content or "").strip()
-                if _task_text and await is_gui_task(self.provider, _task_text, model=self.model):
-                    logger.info("Auto-routing GUI task -> v3 (longhorizon) pipeline")
-                    _v3_ws = self.workspace / "longhorizon_runs" / msg.session_key.replace(":", "_")
-                    _summary = await run_gui_via_v3(
-                        _task_text,
-                        workspace=_v3_ws,
-                        provider=self.provider,
-                        model=self.model,
-                    )
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"[via v3 pipeline]\n{_summary}",
-                    )
-            except Exception as _e:
-                logger.warning(f"v3 GUI routing failed, falling back to normal flow: {_e}")
+        routed = await self._maybe_route_gui_v3(msg, prompt_content)
+        if routed is not None:
+            return routed
 
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
-
-        # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
+        self._wire_tool_contexts(msg)
 
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-
-        # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=prompt_content or msg.content,
@@ -385,88 +430,202 @@ class AgentLoop:
             language_hint_text=language_hint_text,
         )
 
-        # Agent loop
-        iteration = 0
-        final_content = None
-        collected_media: list[str] = []
-        _gui_consecutive_calls = 0  # track consecutive GUI tool calls
-        _GUI_MAX_CONSECUTIVE = 2    # max consecutive gui_action calls before forcing stop
+        # Context-length detector for this session — shared with the streaming
+        # path (web/streaming.py) via get_context_meter so both append to one
+        # curve file.
+        meter = self.get_context_meter(msg.session_key)
 
-        while iteration < self.max_iterations:
-            iteration += 1
+        # Compact context before sending it to the model. This applies a
+        # three-tier strategy (micro-compaction -> LLM summary -> truncation)
+        # when the estimated prompt tokens approach the configured context
+        # window. Unknown budgets (0) are ignored.
+        budget_tokens = getattr(meter, "budget_tokens", 0) or 0
+        if budget_tokens:
+            try:
+                messages = await self.context_compactor.compact(messages, budget_tokens)
+            except Exception as exc:
+                logger.warning(f"Context compaction failed, using original context: {exc}")
 
-            # Call LLM
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
+        # Agent loop — shared primitive (L1). Usage capture + the GUI call
+        # limiter are injected as callbacks; behaviour is identical to the
+        # previous inline loop (and shares formatting with the subagent paths,
+        # including ToolResult.media).
+        from syll.agent.loop_core import run_tool_loop
 
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages,
-                    response.content,
-                    tool_call_dicts,
-                    reasoning_content=response.provider_extra.get("reasoning_content"),
+        loop_result = await run_tool_loop(
+            self.provider,
+            self.tools,
+            messages,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            max_tokens=self._resolve_max_tokens(),
+            on_usage=self._make_usage_callback(meter),
+            pre_execute=self._make_gui_limiter(),
+        )
+        return await self._finalize_turn(msg, session, loop_result)
+
+    async def _maybe_route_gui_v3(
+        self, msg: InboundMessage, prompt_content: str | None
+    ) -> OutboundMessage | None:
+        """Auto-route GUI/desktop tasks to the v3 (longhorizon) pipeline.
+
+        Returns an OutboundMessage when the task was routed (fold + subagent +
+        verification gate + checkpoint/replan instead of a single-shot GUI
+        action), else None so the caller falls through to the normal flow.
+        Gated on gui_config.enabled; any failure falls through so the ghost
+        never breaks here."""
+        if not (self.gui_config and getattr(self.gui_config, "enabled", False)):
+            return None
+        try:
+            from syll.agent.longhorizon.router import is_gui_task, run_gui_via_v3
+
+            task_text = (prompt_content or msg.content or "").strip()
+            if task_text and await is_gui_task(self.provider, task_text, model=self.model):
+                logger.info("Auto-routing GUI task -> v3 (longhorizon) pipeline")
+                v3_workspace = self.workspace / "longhorizon_runs" / msg.session_key.replace(":", "_")
+                v3_summary = await run_gui_via_v3(
+                    task_text,
+                    workspace=v3_workspace,
+                    provider=self.provider,
+                    model=self.model,
                 )
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"[via v3 pipeline]\n{v3_summary}",
+                )
+        except Exception as e:
+            logger.warning(f"v3 GUI routing failed, falling back to normal flow: {e}")
+        return None
 
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
+    def _wire_tool_contexts(self, msg: InboundMessage) -> None:
+        """Give channel-aware tools the current channel/chat_id for replies."""
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(msg.channel, msg.chat_id)
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(msg.channel, msg.chat_id)
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(msg.channel, msg.chat_id)
+        # UITarsTool (gui_action): attach the per-session GUI failure ledger so
+        # genuine failures become revisable state instead of un-addressable
+        # chat text. Duck-typed so the loop has no hard GUI-tool import.
+        ui_tars_tool = self.tools.get("gui_action")
+        if ui_tars_tool is not None and hasattr(ui_tars_tool, "set_session_context"):
+            ui_tars_tool.set_session_context(msg.session_key)
 
-                    # ── GUI call limiter ──────────────────────────────
-                    if tool_call.name in ("gui_action", "gui_action_planned"):
-                        _gui_consecutive_calls += 1
-                        if _gui_consecutive_calls > _GUI_MAX_CONSECUTIVE:
-                            logger.warning(
-                                f"GUI call limit reached ({_gui_consecutive_calls}), "
-                                "forcing stop to prevent infinite retries"
-                            )
-                            result = (
-                                "GUI 操作已达到最大重试次数。请直接告知用户操作失败，"
-                                "不要再次调用 GUI 工具。建议用户手动操作或调整指令后重试。"
-                            )
-                            messages = self.context.add_tool_result(
-                                messages, tool_call.id, tool_call.name, result
-                            )
-                            continue
-                    else:
-                        _gui_consecutive_calls = 0  # reset on non-GUI call
+    def _make_usage_callback(self, meter):
+        """on_usage for run_tool_loop: record each model call's tokens to the
+        session context meter (no-op when no meter is attached)."""
+        def on_usage(resp, it):
+            if meter is None:
+                return
+            try:
+                usage = resp.usage or {}
+                meter.record(
+                    prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                    completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                    phase="orchestrator",
+                    extra={
+                        "iteration": it,
+                        "had_tool_calls": resp.has_tool_calls,
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"meter record skipped: {e}")
+        return on_usage
 
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    if isinstance(result, ToolResult) and result.media:
-                        collected_media.extend(result.media)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+    def _make_gui_limiter(self):
+        """pre_execute for run_tool_loop: gate gui_action calls on the per-task
+        failure ledger (cross-turn persistent lock, clearable via /retry-gui),
+        then cap consecutive GUI calls within this turn. Returns a
+        stop-instruction string when blocking, else None."""
+        gui_consecutive = 0
+        GUI_MAX_CONSECUTIVE = 2
+
+        def pre_execute(tool_call):
+            nonlocal gui_consecutive
+            if tool_call.name in ("gui_action", "gui_action_planned"):
+                # Ledger lock: a genuine GUI failure recorded for THIS task
+                # blocks the call entirely (independent of the per-turn counter).
+                ui_tars = self.tools.get("gui_action")
+                ledger = getattr(ui_tars, "_gui_ledger", None) if ui_tars is not None else None
+                if ledger is not None and tool_call.name == "gui_action":
+                    instr = (tool_call.arguments or {}).get("instruction", "")
+                    if instr and ledger.is_locked(instr):
+                        status = ledger.lock_status(instr) or {}
+                        logger.info(
+                            f"GUI ledger lock active ({status.get('kind')}); "
+                            f"blocking gui_action retry"
+                        )
+                        return (
+                            f"此 GUI 任务此前因「{status.get('kind', '未知')}」失败并被锁定，"
+                            "本次不执行。请告知用户失败原因，或建议其发送 /retry-gui "
+                            "清除锁后重试。"
+                        )
+                gui_consecutive += 1
+                # gui_action is single-step (outer agent drives iteration) — allow
+                # many calls per turn for legitimate multi-step tasks. gui_action_planned
+                # is autonomous multi-step — keep the tight anti-spam cap.
+                cap = 15 if tool_call.name == "gui_action" else GUI_MAX_CONSECUTIVE
+                if gui_consecutive > cap:
+                    logger.warning(
+                        f"GUI call limit reached ({gui_consecutive}/{cap} for "
+                        f"{tool_call.name}), forcing stop to prevent infinite retries"
+                    )
+                    return (
+                        "GUI 操作已达到最大调用次数。请直接告知用户操作失败，"
+                        "不要再次调用 GUI 工具。建议用户手动操作或调整指令后重试。"
                     )
             else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
+                gui_consecutive = 0
+            return None
+        return pre_execute
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+    def _resolve_max_tokens(self) -> int:
+        """Resolve max_tokens for the main loop.
 
-        # Save to session
+        Generous default (16384) so extended-thinking models have room for
+        both thinking tokens and visible content.  Config can override via
+        ``agents.defaults.max_tokens``.
+        """
+        if self.syll_config:
+            try:
+                return self.syll_config.agents.defaults.max_tokens
+            except (AttributeError, TypeError):
+                pass
+        return 16384
+
+    async def _finalize_turn(self, msg: InboundMessage, session, loop_result) -> OutboundMessage:
+        """Persist the turn (session history + event + daily memory) and build
+        the reply OutboundMessage."""
+        collected_media = loop_result.media
+        # Extract content regardless of stop_reason — budget-exhaustion should
+        # not discard the model's last response.  Matches unified_subagent.py:357.
+        last_content = (
+            (loop_result.final_response.content or "")
+            if loop_result.final_response
+            else ""
+        )
+        # Also check reasoning_content (extended thinking models may put all
+        # output in reasoning and leave content empty).
+        if not last_content and loop_result.final_response:
+            rc = loop_result.final_response.provider_extra.get("reasoning_content")
+            if rc:
+                last_content = rc[:2000]
+        if not last_content:
+            if loop_result.stop_reason == "budget":
+                last_content = "⚠️ Agent reached iteration limit without a final answer."
+            else:
+                last_content = "⚠️ Agent completed but produced no text response."
+        final_content = last_content
+
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
 
-        # Log event to event store
         event = Event(
             agent_type="im_agent",
             event_type="message",
@@ -479,20 +638,25 @@ class AgentLoop:
                 text=f"User: {msg.content}\nAssistant: {final_content}",
                 media=collected_media,
                 metadata={
-                    "iterations": iteration,
+                    "iterations": loop_result.iterations,
                     "session_key": msg.session_key,
                 },
             ),
         )
         self.event_store.log_event(event)
 
-        # Append to daily memory
         try:
             from datetime import datetime
             summary = f"- [{datetime.now().strftime('%H:%M')}] User: {msg.content[:100]}\n"
             self.context.memory.append_today(summary)
         except Exception as e:
             logger.debug(f"Failed to append daily memory: {e}")
+
+        # Memory flush turn: promote reusable facts to long-term memory.
+        try:
+            await self.memory_flusher.flush(msg.content, final_content)
+        except Exception as e:
+            logger.debug(f"Memory flush turn failed: {e}")
 
         return OutboundMessage(
             channel=msg.channel,

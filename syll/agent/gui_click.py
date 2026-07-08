@@ -1,13 +1,24 @@
-"""Shared click helpers for GUI execution backends."""
+"""Shared click helpers for GUI execution backends.
+
+These helpers now operate on an :class:`syll.sandbox.environment.Environment`
+so the same GUI dispatch code can target the local desktop or a future sandbox
+container without changing the call sites in ``UITarsTool`` and
+``AlohaExecutor``.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import platform
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from syll.sandbox.environment import Environment
 
 CLICK_INTERVAL = 0.12
 POST_CLICK_WAIT = 0.35
@@ -649,8 +660,48 @@ def _ensure_click_allowed(diagnostics: ClickDiagnostics, config: Any | None = No
         raise ClickDispatchError(_permission_failure_message(diagnostics))
 
 
+def _prepare_backend(
+    environment: "Environment",
+    *,
+    raw: dict[str, Any] | None = None,
+    config: Any | None = None,
+    check_allowed: bool = True,
+) -> tuple[BaseMouseBackend, ClickDiagnostics]:
+    """Resolve the mouse backend, attach diagnostics, and gate on permissions.
+
+    The backend is still resolved against the local pyautogui layer for
+    diagnostics and macOS accessibility checks. The actual pointer action is
+    dispatched through ``environment`` so the same code can target a sandbox.
+    """
+    import pyautogui
+
+    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
+    attach_click_diagnostics(raw, diagnostics)
+    if check_allowed:
+        _ensure_click_allowed(diagnostics, config)
+    return backend, diagnostics
+
+
+def type_text(environment: "Environment", text: str, *, interval: float = 0.05) -> None:
+    """Type ``text`` using the environment's keyboard primitive.
+
+    Non-ASCII input handling is now the responsibility of the concrete
+    ``Environment`` implementation (e.g. :class:`LocalEnvironment` uses the
+    clipboard paste fallback). This helper exists to keep the call sites
+    uniform.
+    """
+    # ``Environment.type`` is async; provide a sync wrapper for callers that
+    # are still synchronous.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(environment.type(text))
+        return
+    asyncio.create_task(environment.type(text))
+
+
 async def open_desktop_app_with_shortcut(
-    pyautogui: Any,
+    environment: "Environment",
     x: int,
     y: int,
     *,
@@ -660,21 +711,12 @@ async def open_desktop_app_with_shortcut(
     post_wait: float = DESKTOP_APP_OPEN_WAIT,
 ) -> str:
     """Select a desktop app icon, then open it with Cmd+O on macOS."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    _ensure_click_allowed(diagnostics, config)
+    backend, diagnostics = _prepare_backend(environment, raw=raw, config=config)
 
-    previous_pause = getattr(pyautogui, "PAUSE", None)
-    try:
-        if previous_pause is not None:
-            pyautogui.PAUSE = 0
-        await backend.left_click_once(x, y, click_state=1)
-        await asyncio.sleep(selection_wait)
-        pyautogui.hotkey("command", "o")
-        await asyncio.sleep(post_wait)
-    finally:
-        if previous_pause is not None:
-            pyautogui.PAUSE = previous_pause
+    await environment.click(x, y)
+    await asyncio.sleep(selection_wait)
+    await environment.keypress("command+o")
+    await asyncio.sleep(post_wait)
 
     return format_diagnostic_message(
         f"Selected desktop app at ({x}, {y}) and opened with Command+O",
@@ -683,7 +725,7 @@ async def open_desktop_app_with_shortcut(
 
 
 async def perform_click_sequence(
-    pyautogui: Any,
+    environment: "Environment",
     x: int,
     y: int,
     count: int = 1,
@@ -693,17 +735,15 @@ async def perform_click_sequence(
     interval: float = CLICK_INTERVAL,
     post_wait: float = POST_CLICK_WAIT,
 ) -> str:
-    """Perform explicit click sequences through the resolved backend."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    _ensure_click_allowed(diagnostics, config)
+    """Perform explicit click sequences through the environment."""
+    backend, diagnostics = _prepare_backend(environment, raw=raw, config=config)
 
     normalized_count = max(1, int(count))
     if normalized_count == 1:
         normalized_count += DEFAULT_EXTRA_CLICKS
 
     for idx in range(normalized_count):
-        await backend.left_click_once(x, y, click_state=idx + 1)
+        await environment.click(x, y)
         if idx < normalized_count - 1:
             await asyncio.sleep(interval)
 
@@ -721,7 +761,7 @@ async def perform_click_sequence(
 
 
 async def perform_right_click(
-    pyautogui: Any,
+    environment: "Environment",
     x: int,
     y: int,
     *,
@@ -729,32 +769,33 @@ async def perform_right_click(
     config: Any | None = None,
     post_wait: float = POST_CLICK_WAIT,
 ) -> str:
-    """Perform a right click through the resolved backend."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    _ensure_click_allowed(diagnostics, config)
-    await backend.right_click(x, y)
+    """Perform a right click through the environment."""
+    backend, diagnostics = _prepare_backend(environment, raw=raw, config=config)
+    await environment.right_click(x, y)
     await asyncio.sleep(post_wait)
     return format_diagnostic_message(f"Right-clicked at ({x}, {y})", diagnostics)
 
 
 async def perform_move(
-    pyautogui: Any,
+    environment: "Environment",
     x: int,
     y: int,
     *,
     raw: dict[str, Any] | None = None,
     config: Any | None = None,
 ) -> str:
-    """Move the pointer through the resolved backend."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    await backend.move_to(x, y)
+    """Move the pointer through the environment."""
+    # Ungated on purpose: a move dispatches no click event, so the
+    # accessibility gate (which guards click dispatch) is skipped here.
+    backend, diagnostics = _prepare_backend(
+        environment, raw=raw, config=config, check_allowed=False
+    )
+    await environment.move(x, y)
     return format_diagnostic_message(f"Moved to ({x}, {y})", diagnostics)
 
 
 async def perform_drag(
-    pyautogui: Any,
+    environment: "Environment",
     start: tuple[int, int],
     end: tuple[int, int],
     *,
@@ -762,17 +803,15 @@ async def perform_drag(
     config: Any | None = None,
     duration: float = DEFAULT_DRAG_DURATION,
 ) -> str:
-    """Drag via the resolved backend."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    _ensure_click_allowed(diagnostics, config)
-    await backend.drag(start, end, duration=duration)
+    """Drag via the environment."""
+    backend, diagnostics = _prepare_backend(environment, raw=raw, config=config)
+    await environment.drag(start[0], start[1], end[0], end[1])
     await asyncio.sleep(POST_CLICK_WAIT)
     return format_diagnostic_message(f"Dragged from {start} to {end}", diagnostics)
 
 
 async def perform_press(
-    pyautogui: Any,
+    environment: "Environment",
     x: int,
     y: int,
     *,
@@ -780,10 +819,15 @@ async def perform_press(
     config: Any | None = None,
     duration: float = DEFAULT_PRESS_DURATION,
 ) -> str:
-    """Press-and-hold via the resolved backend."""
-    backend, diagnostics = get_mouse_backend(pyautogui, config=config)
-    attach_click_diagnostics(raw, diagnostics)
-    _ensure_click_allowed(diagnostics, config)
-    await backend.press(x, y, duration=duration)
+    """Press-and-hold via the environment."""
+    backend, diagnostics = _prepare_backend(environment, raw=raw, config=config)
+    # Long-press is not part of the core Environment interface, so emulate it
+    # with a mouse-down / wait / mouse-up sequence using the raw pointer API.
+    import pyautogui
+
+    pyautogui.moveTo(x, y)
+    pyautogui.mouseDown(x=x, y=y)
+    await asyncio.sleep(duration)
+    pyautogui.mouseUp(x=x, y=y)
     await asyncio.sleep(POST_CLICK_WAIT)
     return format_diagnostic_message(f"Pressed at ({x}, {y})", diagnostics)

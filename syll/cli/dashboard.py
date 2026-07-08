@@ -430,14 +430,25 @@ class DashboardApp(App):
         line.append(text, style=CHAT_META_STYLE)
         return line
 
-    def _system_line(self, level: str, source: str, message: str) -> Text:
-        body = f"{level.lower()} {source} · {message}"
-        return self._speaker_line(
-            "system",
-            body,
-            label_style=SYSTEM_LABEL_STYLE,
-            body_style=SYSTEM_BODY_STYLE,
-        )
+    def _system_line(
+        self, level: str, source: str, message: str, time_str: str | None = None
+    ) -> Text:
+        level_upper = level.upper()
+        level_color = LOG_COLORS.get(level_upper, SYSTEM_BODY_STYLE)
+        if level_upper in ("INFO", "SUCCESS"):
+            level_style = f"bold {level_color}"
+        elif level_upper in ("WARNING", "ERROR", "CRITICAL"):
+            level_style = f"italic {level_color}"
+        else:
+            level_style = SYSTEM_BODY_STYLE
+
+        line = Text()
+        line.append(self._chat_label("system"), style=SYSTEM_LABEL_STYLE)
+        if time_str:
+            line.append(f"{time_str} ", style=SYSTEM_BODY_STYLE)
+        line.append(level_upper, style=level_style)
+        line.append(f" {source} · {message}", style=SYSTEM_BODY_STYLE)
+        return line
 
     def _activity_height(self) -> int:
         if self._activity_height_override is not None:
@@ -652,7 +663,7 @@ class DashboardApp(App):
         log = self._log()
         if log is None:
             return
-        log.write(self._system_line(level, name, message))
+        log.write(self._system_line(level, name, message, time_str=time_str))
 
     def _assistant_meta_line(self, text: str) -> Text:
         return self._speaker_line(

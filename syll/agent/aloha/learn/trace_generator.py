@@ -1,7 +1,7 @@
 """Trace generator: generates natural-language step descriptions via LLM.
 
 Adapted from ShowUI-Aloha/Aloha_Learn/trace_generator.py.
-Uses litellm for unified LLM access instead of direct OpenAI/Claude API calls.
+Routes LLM calls through the shared LLMProvider (usage → ContextMeter).
 """
 
 import base64
@@ -34,6 +34,15 @@ class TraceGenerator:
         self.model = model
         self.api_key = api_key
         self.api_base = api_base
+        # LLMProvider cache: route through the shared provider so usage is
+        # observable. Requires api_key (no silent litellm fallback).
+        self._provider = None
+        if api_key:
+            try:
+                from syll.providers.litellm_provider import LiteLLMProvider
+                self._provider = LiteLLMProvider(api_key=api_key, api_base=api_base)
+            except Exception:
+                pass
 
     @staticmethod
     def _val(d: dict[str, Any], *keys, default=""):
@@ -177,29 +186,18 @@ Respond with JSON only. If your first attempt is not valid JSON, immediately re-
     async def _call_llm(
         self, prompt: str, crop_b64: str | None, full_b64: str | None
     ) -> str:
-        """Call LLM via litellm with images."""
-        import litellm
-
+        """Call the vision LLM with crop + full screenshots."""
         content: list[dict] = [{"type": "text", "text": prompt}]
         if crop_b64:
             content.append({"type": "image_url", "image_url": {"url": crop_b64}})
         if full_b64:
             content.append({"type": "image_url", "image_url": {"url": full_b64}})
 
-        kwargs: dict[str, Any] = {}
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-
-        response = await litellm.acompletion(
-            model=self.model,
+        resp = await self._provider.chat(
             messages=[{"role": "user", "content": content}],
-            temperature=0.2,
-            max_tokens=1200,
-            **kwargs,
+            model=self.model, temperature=0.2, max_tokens=1200,
         )
-        return response.choices[0].message.content
+        return resp.content
 
     async def generate_trace(
         self,

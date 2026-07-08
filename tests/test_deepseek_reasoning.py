@@ -362,7 +362,7 @@ def test_streaming_tool_call_passes_reasoning_content_to_assistant_message(monke
         def __init__(self):
             self.calls = 0
 
-        async def chat_stream(self, messages, tools, model):
+        async def chat_stream(self, messages, tools, model, max_tokens=None):
             self.calls += 1
             if self.calls == 1:
                 yield {
@@ -401,6 +401,7 @@ def test_streaming_tool_call_passes_reasoning_content_to_assistant_message(monke
         model="deepseek/deepseek-v4-pro",
         max_iterations=2,
         event_store=_EventStore(),
+        get_context_meter=lambda _session_key: None,
     )
 
     events = asyncio.run(

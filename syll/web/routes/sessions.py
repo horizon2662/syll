@@ -43,3 +43,14 @@ async def delete_session(key: str, request: Request):
     if sm.delete(key):
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Session not found")
+
+
+@router.delete("/gui-locks/{key:path}")
+async def clear_gui_locks(key: str):
+    """Clear all GUI failure locks for a session.
+
+    The revisable-failure-memory revision door: a genuine GUI failure (stuck /
+    max-steps / action-exec) locks the task until cleared here or via the
+    ``/retry-gui`` CLI command. Transient failures never lock."""
+    from syll.agent.gui_failure_ledger import GuiAttemptLedger
+    return {"ok": True, "cleared": GuiAttemptLedger(key).clear_all()}

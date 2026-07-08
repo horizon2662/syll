@@ -32,6 +32,9 @@ import asyncio
 import json
 import re
 import sys
+import time
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -39,9 +42,11 @@ from loguru import logger
 
 from syll.bus.queue import MessageBus
 from syll.providers.litellm_provider import LiteLLMProvider
+from syll.sandbox.environment import LocalEnvironment
 
 from .config import RunnerConfig
 from .contract import SubagentResult
+from .telemetry import DecisionUnit, log_node, node_key as make_node_key
 from .global_memory import GlobalMemory
 from .hierarchical_plan_manager import HierarchicalPlanManager
 from .session_state import SessionState
@@ -105,7 +110,28 @@ class Runner:
             event_store = EventStore(ws.parent)
         except Exception:
             event_store = None
+        self.event_store = event_store
+        self.run_id = str(uuid.uuid4())  # one telemetry episode id per process run
+        self._seq = 0
+        # Context-length detector: captures the token cost the provider already
+        # returns (previously discarded). Writes {ws}/audit/context_curve.jsonl.
+        # Phase 1.5: budget resolved from cfg.context_window (SYLL_CONTEXT_WINDOW)
+        # > litellm table > 0. With a real budget, utilization/over_budget light up.
+        try:
+            from .context_meter import ContextMeter, resolve_context_window
+            self.meter = ContextMeter(
+                run_dir=ws / "audit",
+                run_id=self.run_id,
+                budget_tokens=resolve_context_window(
+                    self.cfg.model, getattr(self.cfg, "context_window", 0)
+                ),
+            )
+        except Exception as exc:
+            logger.debug(f"context meter disabled: {exc}")
+            self.meter = None
 
+        self.environment = LocalEnvironment(workspace_root=ws)
+        self.skill_mem = SkillMemory(ws, cfg.skill)
         self.subagents = UnifiedSubagentManager(
             provider=provider,
             workspace=ws,
@@ -115,9 +141,11 @@ class Runner:
             gui_config=gui_cfg,
             syll_config=syll_cfg,
             event_store=event_store,
+            context_meter=self.meter,
+            skill_memory=self.skill_mem,
+            environment=self.environment,
         )
         self.hpm = HierarchicalPlanManager(ws, cfg.skill)
-        self.skill_mem = SkillMemory(ws, cfg.skill)
         self.global_mem = GlobalMemory(ws)
         self.session = SessionState(ws, cfg.skill)
         self._notes: list[str] = []  # orchestrator working memory (compacted)
@@ -181,69 +209,49 @@ class Runner:
                 continue
 
             print(f"[step {step.index}] {step.description}")
-            result = await self.subagents.run_sync(
-                task=step.description,
-                label=f"M{cur_milestone}.S{step.index}",
-                skill=self.cfg.skill,
-                objective=step.description,
-                context_slice=self._build_context_slice(step.description),
+            seq = self._next_seq()
+            # retry-same-node loop (budget 0 under default recovery_mode="replan",
+            # so this runs exactly once and control flow is unchanged).
+            retry_budget = (
+                self.cfg.max_retries_per_step
+                if self.cfg.recovery_mode in ("retry_same_node", "retry_then_replan")
+                else 0
             )
-
-            # --- verification gate: catch false success ---
-            # A subagent may claim status=ok + artifacts it never actually wrote.
-            # Check the claimed files exist in the workspace; if not, downgrade
-            # to a failure so the replan loop re-does the work for real.
-            if result.ok and result.artifacts:
-                ok_art, miss = self._verify_artifacts(result)
-                if not ok_art:
-                    print(f"  ! FALSE SUCCESS: claimed {result.artifacts} -> {miss}")
-                    self.skill_mem.ingest(
-                        [f"False success on '{step.description[:60]}': claimed "
-                         f"{result.artifacts} but {miss}. Do the work for real and "
-                         f"write under {self.cfg.workspace}."],
-                        status_ok=False,
-                    )
-                    self.global_mem.log(
-                        f"M{cur_milestone}.S{step.index} FALSE SUCCESS: {miss}"
-                    )
-                    result = SubagentResult(
-                        run_id=result.run_id,
-                        status="failed",
-                        summary=result.summary,
-                        diagnosis=(f"False success: claimed artifacts "
-                                   f"{result.artifacts} not found ({miss}). Re-do "
-                                   f"the work and actually create the files under "
-                                   f"{self.cfg.workspace}."),
-                    )
+            result = None
+            prior = None
+            for attempt in range(1, retry_budget + 2):
+                result = await self._attempt_step(
+                    plan, step, cur_milestone, attempt, seq, prior_result=prior
+                )
+                if result.ok:
+                    break
+                prior = result  # fed back into context iff retry_context == "replay"
+                if attempt <= retry_budget:
+                    print(f"  ~ attempt {attempt} failed -> retry_same_node "
+                          f"({self.cfg.retry_context}) [{attempt}/{retry_budget}]")
 
             if result.ok:
-                self.hpm.update_step(plan, step.index, "DONE", result.summary[:200])
-                if result.lessons:
-                    self.skill_mem.ingest(result.lessons, status_ok=True)
-                self.global_mem.log(
-                    f"M{cur_milestone}.S{step.index} ok: {result.summary[:120]}"
-                )
-                self._notes.append(f"step {step.index} ok: {result.summary[:200]}")
+                self._record_step_success(plan, step, cur_milestone, result)
                 i += 1
-            else:
+            elif self.cfg.recovery_mode in ("replan", "retry_then_replan"):
                 key = f"{step.index}:{step.description[:40]}"
                 attempts = replan_counts.get(key, 0)
                 if attempts >= self.cfg.max_replans_per_step:
                     print(f"  ! max replans reached for step {step.index}; "
                           f"marking FAILED and moving on")
-                    self.hpm.update_step(plan, step.index, "FAILED", result.diagnosis[:200])
-                    self.skill_mem.ingest(
-                        [f"Step '{step.description[:60]}' repeatedly failed: "
-                         f"{result.diagnosis[:120]}"],
-                        status_ok=False,
-                    )
-                    self.global_mem.log(
-                        f"M{cur_milestone}.S{step.index} GAVE UP: {result.diagnosis[:120]}"
+                    self._give_up_step(
+                        plan, step, cur_milestone, result,
+                        lesson=(f"Step '{step.description[:60]}' repeatedly failed: "
+                                f"{result.diagnosis[:120]}"),
+                        log_msg=f"GAVE UP: {result.diagnosis[:120]}",
                     )
                     i += 1
                 else:
                     replan_counts[key] = attempts + 1
-                    new_steps = await self._propose_replan(step.description, result.diagnosis)
+                    new_steps = await self._propose_replan(
+                        step.description, result.diagnosis,
+                        plan=plan, focus_step_index=step.index,
+                    )
                     print(f"  ! FAILED ({result.diagnosis[:80]}) "
                           f"-> replan {len(new_steps)} step(s)")
                     failed_desc = step.description
@@ -255,9 +263,40 @@ class Runner:
                         f"-> replan attempt {attempts + 1}"
                     )
                     i = self._first_replan_after(plan, failed_desc)
+            else:
+                # recovery_mode == "retry_same_node": retries exhausted -> give up
+                print(f"  ! retries exhausted for step {step.index}; marking FAILED")
+                self._give_up_step(
+                    plan, step, cur_milestone, result,
+                    lesson=(f"Step '{step.description[:60]}' failed after {retry_budget} "
+                            f"retries: {result.diagnosis[:120]}"),
+                    log_msg=f"GAVE UP after {retry_budget} retries",
+                )
+                i += 1
 
             self._checkpoint(plan, cur_milestone, step.index)
             await self._compact_if_needed()
+
+    def _record_step_success(self, plan, step, cur_milestone, result) -> None:
+        """Mark a step DONE, ingest its lessons, and log/record the outcome."""
+        self.hpm.update_step(plan, step.index, "DONE", result.summary[:200])
+        if result.lessons:
+            self.skill_mem.ingest(result.lessons, status_ok=True)
+        self.global_mem.log(
+            f"M{cur_milestone}.S{step.index} ok: {result.summary[:120]}"
+        )
+        self._notes.append(f"step {step.index} ok: {result.summary[:200]}")
+
+    def _give_up_step(
+        self, plan, step, cur_milestone, result, *, lesson: str, log_msg: str
+    ) -> None:
+        """Mark a step FAILED, ingest its pitfall as a skill lesson, log GAVE UP.
+
+        Shared by the 'max replans reached' and 'retries exhausted' give-up
+        paths (previously two near-identical open-coded blocks)."""
+        self.hpm.update_step(plan, step.index, "FAILED", result.diagnosis[:200])
+        self.skill_mem.ingest([lesson], status_ok=False)
+        self.global_mem.log(f"M{cur_milestone}.S{step.index} {log_msg}")
 
     # ------------------------------------------------------------------
     # main-brain LLM calls (decision points)
@@ -290,13 +329,10 @@ class Runner:
         out: list[tuple[str, list[str]]] = []
         for _attempt in range(3):
             try:
-                resp = await self.provider.chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=self.cfg.model,
-                    max_tokens=1500,
-                    temperature=0.3,
+                text = await self._orchestrator_llm(
+                    prompt, label="plan", max_tokens=1500
                 )
-                data = _extract_json((resp.content if resp else None) or "")
+                data = _extract_json(text)
             except Exception:
                 data = None
             if isinstance(data, list):
@@ -320,23 +356,33 @@ class Runner:
         )
         return [(task or "task", [task] if task else [])]
 
-    async def _propose_replan(self, step_desc: str, diagnosis: str) -> list[str]:
+    async def _propose_replan(
+        self, step_desc: str, diagnosis: str, *, plan=None, focus_step_index=None
+    ) -> list[str]:
+        progress = (
+            self.hpm.render_progress(
+                plan, focus_step_index=focus_step_index, last_diagnosis=diagnosis
+            )
+            if plan is not None
+            else ""
+        )
         prompt = (
             "A plan step failed. Propose 1-3 REPLACEMENT steps that achieve the "
             "same goal while avoiding the diagnosed failure. Respond ONLY with "
             "JSON: {\"steps\": [str]}.\n\n"
             f"Failed step: {step_desc}\n"
             f"Diagnosis: {diagnosis}\n"
-            f"Relevant skill memory:\n"
+        )
+        if progress:
+            # Plan-wide context so replan respects what's already done and what
+            # depends on this step (long-horizon anti-disorientation).
+            prompt += f"\n{progress}\n\n"
+        prompt += (
+            "Relevant skill memory:\n"
             f"{self.skill_mem.get_relevant(step_desc)[:1200] or '(none)'}"
         )
-        resp = await self.provider.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model=self.cfg.model,
-            max_tokens=800,
-            temperature=0.3,
-        )
-        data = _extract_json(resp.content or "")
+        text = await self._orchestrator_llm(prompt, label="replan", max_tokens=800)
+        data = _extract_json(text)
         if isinstance(data, dict):
             steps = data.get("steps", [])
             return [str(s) for s in steps if s]
@@ -353,17 +399,249 @@ class Runner:
             "(<= 200 words). Keep decisions, what worked, and open issues.\n\n"
             + "\n".join(self._notes)
         )
-        resp = await self.provider.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model=self.cfg.model,
-            max_tokens=500,
-            temperature=0.2,
+        text = await self._orchestrator_llm(
+            prompt, label="compact", max_tokens=500, temperature=0.2
         )
-        return (resp.content or "").strip()
+        return text.strip()
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _meter_orchestrator(self, resp, label: str = "") -> None:
+        """Record the orchestrator's OWN LLM cost (plan/replan/compact) so the
+        Performance tab's main-vs-subagent split is accurate for longhorizon
+        runs. Without this, longhorizon runs would look 100% subagent."""
+        if self.meter is None or resp is None:
+            return
+        try:
+            u = getattr(resp, "usage", None) or {}
+            self.meter.record(
+                prompt_tokens=int(u.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(u.get("completion_tokens", 0) or 0),
+                phase="orchestrator",
+                extra={"orchestrator": label},
+            )
+        except Exception:  # metering must never break a run
+            pass
+
+    async def _orchestrator_llm(
+        self,
+        prompt: str,
+        *,
+        label: str,
+        max_tokens: int,
+        temperature: float = 0.3,
+    ) -> str:
+        """One main-brain LLM call: send ``prompt`` as a single user turn,
+        record its cost under ``label`` (plan/replan/compact), return the text.
+
+        Consolidates the ``provider.chat`` + ``_meter_orchestrator`` preamble
+        previously open-coded in _propose_milestones / _propose_replan /
+        _compact_notes. Returns ``""`` when the provider yields no content,
+        matching the previous ``resp.content or ""`` handling.
+        """
+        resp = await self.provider.chat(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.cfg.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        self._meter_orchestrator(resp, label)
+        return (resp.content if resp else None) or ""
+
+    async def _attempt_step(
+        self, plan, step, cur_milestone: int, attempt: int, seq: int, prior_result=None
+    ):
+        """Run ONE attempt of a step and emit one DecisionUnit telemetry record.
+
+        Streams kept independent (anti-circularity): the subagent's self-reported
+        ``ok`` is the NOISY verifier verdict; ``_verify_artifacts`` (files exist on
+        disk) is the DETERMINISTIC oracle. The verdict is captured BEFORE any
+        oracle-driven downgrade so the {verdict x oracle} matrix measures beta.
+        """
+        ctx = self._build_context_with_replay(plan, step, prior_result)
+
+        t0 = time.monotonic()
+        result = await self.subagents.run_sync(
+            task=step.description,
+            label=f"M{cur_milestone}.S{step.index}#{attempt}",
+            skill=self.cfg.skill,
+            objective=step.description,
+            context_slice=ctx,
+        )
+        wall_ms = int((time.monotonic() - t0) * 1000)
+
+        verdict = "PASS" if result.ok else "FAIL"  # captured BEFORE the oracle gate
+        oracle_label, oracle_detail, result = self._apply_oracle(step, cur_milestone, result)
+
+        self._emit_telemetry(
+            step=step, cur_milestone=cur_milestone, attempt=attempt, seq=seq,
+            result=result, verdict=verdict, oracle_label=oracle_label,
+            oracle_detail=oracle_detail, context_slice=ctx, wall_ms=wall_ms,
+        )
+        return result
+
+    def _build_context_with_replay(self, plan, step, prior_result) -> str:
+        """Context slice for this attempt; re-injects the prior failed attempt
+        when retry_context == 'replay' (A1 context-sovereignty violation, on
+        purpose so a retry sees why it failed)."""
+        ctx = self._build_context_slice(
+            step.description,
+            plan=plan,
+            focus_step_index=step.index,
+            last_diagnosis=(prior_result.diagnosis if prior_result else None),
+        )
+        if self.cfg.retry_context == "replay" and prior_result is not None:
+            ctx = (
+                f"{ctx}\n\n## Previous attempt (failed)\n"
+                f"{(prior_result.summary or '')[:800]}\n"
+                f"Diagnosis: {(prior_result.diagnosis or '')[:400]}"
+            )
+        return ctx
+
+    def _apply_oracle(self, step, cur_milestone, result):
+        """TVAE artifact-existence gate. Returns (oracle_label, oracle_detail, result).
+
+        ``result`` is downgraded (false success -> failed) via copy-with-override
+        when the oracle contradicts the verifier, preserving iterations/tokens/
+        lessons/artifacts. NB: the caller must capture ``verdict`` from
+        ``result.ok`` BEFORE calling this — it measures the noisy verifier,
+        pre-oracle, for the {verdict x oracle} beta matrix."""
+        if not result.artifacts:
+            return None, None, result
+        ok_art, miss = self._verify_artifacts(result)
+        oracle_label = "correct" if ok_art else "wrong"
+        oracle_detail = miss or "all claimed artifacts present"
+        if result.ok and not ok_art:
+            # ORACLE overrides verifier: false success -> downgrade for control flow.
+            print(f"  ! FALSE SUCCESS: claimed {result.artifacts} -> {miss}")
+            self.skill_mem.ingest(
+                [f"False success on '{step.description[:60]}': claimed "
+                 f"{result.artifacts} but {miss}. Do the work for real and "
+                 f"write under {self.cfg.workspace}."],
+                status_ok=False,
+            )
+            self.global_mem.log(
+                f"M{cur_milestone}.S{step.index} FALSE SUCCESS: {miss}"
+            )
+            # ORACLE downgrade via copy-with-override: preserves
+            # iterations_used / tokens / lessons / artifacts. The old
+            # fresh-construction silently dropped them (bug R1).
+            result = replace(
+                result,
+                status="failed",
+                diagnosis=(f"False success: claimed artifacts "
+                           f"{result.artifacts} not found ({miss}). Re-do the "
+                           f"work and actually create the files under "
+                           f"{self.cfg.workspace}."),
+            )
+        return oracle_label, oracle_detail, result
+
+    def _emit_telemetry(
+        self, *, step, cur_milestone, attempt, seq, result, verdict,
+        oracle_label, oracle_detail, context_slice, wall_ms,
+    ) -> None:
+        """Emit one DecisionUnit + one meter curve point (additive; never raises)."""
+        node_key = make_node_key("step", cur_milestone, step.index, step.description)
+
+        # Meter curve point — independent of EventStore so the context detector
+        # still records even if the event store import failed.
+        if self.meter is not None:
+            try:
+                self.meter.record(
+                    prompt_tokens=result.last_prompt_tokens,
+                    completion_tokens=result.tokens_out,
+                    phase="step",
+                    node_key=node_key,
+                    extra={
+                        "attempt": attempt,
+                        "verdict": verdict,
+                        "oracle_label": oracle_label,
+                        "seq": seq,
+                        "milestone": cur_milestone,
+                        "step_index": step.index,
+                    },
+                )
+            except Exception as exc:  # meter must never break a run
+                logger.debug(f"meter record skipped: {exc}")
+
+        # Build the DecisionUnit once; mirror it run-locally (always, so
+        # phase-3 metrics can read events.jsonl without the EventStore) and
+        # log to the global EventStore when available.
+        du = self._build_decision_unit(
+            node_key=node_key, step=step, cur_milestone=cur_milestone,
+            attempt=attempt, seq=seq, result=result, verdict=verdict,
+            oracle_label=oracle_label, oracle_detail=oracle_detail,
+            context_slice=context_slice, wall_ms=wall_ms,
+        )
+        if du is None:
+            return
+        self._emit_to_sinks(du)
+
+    def _build_decision_unit(
+        self, *, node_key, step, cur_milestone, attempt, seq, result, verdict,
+        oracle_label, oracle_detail, context_slice, wall_ms,
+    ):
+        """Construct one DecisionUnit for this attempt, or None on error.
+
+        The 25-field telemetry record (paper-telemetry-spec.md). Extracted from
+        _emit_telemetry so the record shape has a single definition."""
+        try:
+            return DecisionUnit(
+                run_id=self.run_id,
+                node_key=node_key,
+                parent_key=f"milestone:{cur_milestone}",
+                level="step",
+                seq=seq,
+                depth=1,
+                attempt=attempt,
+                is_retry=attempt > 1,
+                instruction=step.description,
+                skill_name=self.cfg.skill,
+                executor_model=self.cfg.model,
+                verifier_type="llm_self_report",
+                verifier_verdict=verdict,
+                oracle_available=oracle_label is not None,
+                oracle_label=oracle_label,
+                oracle_type="artifact_exists" if oracle_label is not None else None,
+                oracle_detail=oracle_detail,
+                triggered_recovery=verdict == "FAIL",
+                recovery_mode=(self.cfg.recovery_mode if attempt == 1
+                               else f"retry_{self.cfg.retry_context}"),
+                diagnosis=((result.diagnosis or "")[:300] or None),
+                context_chars=len(context_slice or ""),
+                memory_injected_chars=len(context_slice or ""),
+                executor_tokens_in=result.tokens_in,
+                executor_tokens_out=result.tokens_out,
+                context_tokens_in=result.tokens_in,
+                active_context_tokens=result.last_prompt_tokens,
+                compaction_active=bool(self._compaction_summary),
+                wall_ms=wall_ms,
+            )
+        except Exception as exc:
+            logger.debug(f"telemetry du build skipped: {exc}")
+            return None
+
+    def _emit_to_sinks(self, du) -> None:
+        """Mirror the DU run-locally (events.jsonl) and to the global EventStore.
+
+        The two sinks are independent — either failing must not block the other
+        or the run."""
+        if self.meter is not None:
+            try:
+                self.meter.log_decision_unit(du.model_dump())
+            except Exception as exc:  # local mirror must never break a run
+                logger.debug(f"du local log skipped: {exc}")
+        if self.event_store is not None:
+            try:
+                log_node(self.event_store, du)
+            except Exception as exc:  # telemetry must never break a run
+                logger.debug(f"telemetry emit skipped: {exc}")
+
     def _verify_artifacts(self, result: SubagentResult) -> tuple[bool, str]:
         """TVAE-style verification gate: artifacts a subagent claims to have
         produced must actually exist. Turns a hallucinated 'ok' (false success)
@@ -379,12 +657,23 @@ class Runner:
             return False, f"missing in workspace: {missing}"
         return True, ""
 
-    def _build_context_slice(self, step_desc: str) -> str:
+    def _build_context_slice(
+        self, step_desc: str, *, plan=None, focus_step_index=None, last_diagnosis=None
+    ) -> str:
         g = self.global_mem.distill_for_skill(self.cfg.skill, step_desc)
         s = self.skill_mem.get_relevant(step_desc)
         parts = [p for p in (g, s) if p]
         if self._compaction_summary:
             parts.append(f"(progress so far)\n{self._compaction_summary}")
+        # Long-horizon anti-disorientation: inject a compact plan-progress
+        # snapshot so a retrying subagent sees the global thread + why its
+        # previous attempt failed, not just the current step in isolation.
+        if plan is not None:
+            prog = self.hpm.render_progress(
+                plan, focus_step_index=focus_step_index, last_diagnosis=last_diagnosis
+            )
+            if prog:
+                parts.append(prog)
         return "\n\n".join(parts)
 
     async def _compact_if_needed(self) -> None:
@@ -410,10 +699,13 @@ class Runner:
 
         ``align()`` marks the failed step FAILED and splices [REPLAN] steps
         immediately after it, then re-indexes sequentially. We resume at the
-        first step following the FAILED step."""
+        first step following the FAILED step. Advancing to ``len(plan.steps)``
+        (not ``len-1``) lets the loop exit when the failed step was the LAST
+        step and replan produced no replacement steps — otherwise the cursor
+        would point back at the FAILED step itself and re-attempt it."""
         for idx, step in enumerate(plan.steps):
             if step.description == failed_desc and step.status == "FAILED":
-                return min(idx + 1, len(plan.steps) - 1)
+                return min(idx + 1, len(plan.steps))
         # Fallback: start over (should not happen).
         return 0
 

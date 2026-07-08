@@ -531,6 +531,7 @@ def wake(
                 session_manager=agent.sessions,
                 skills_loader=agent.context.skills,
                 memory_store=agent.context.memory,
+                workspace_memory_store=getattr(agent.context, "workspace_memory", None),
                 cron_service=cron,
             )
             # v3: attach channel_manager so POST /api/v1/cron/jobs can validate deliver
@@ -806,6 +807,7 @@ def web(
         session_manager=agent_loop.sessions,
         skills_loader=agent_loop.context.skills,
         memory_store=agent_loop.context.memory,
+        workspace_memory_store=getattr(agent_loop.context, "workspace_memory", None),
         cron_service=cron,
     )
     # Phase 1c: tell the lifespan it owns MCP startup (no external bootstrap

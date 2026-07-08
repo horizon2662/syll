@@ -1,5 +1,6 @@
 """Standalone screenshot tool for capturing the desktop screen."""
 
+import base64
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -7,10 +8,14 @@ from typing import Any
 from loguru import logger
 
 from syll.agent.tools.base import Tool, ToolResult
+from syll.sandbox.environment import Environment
 
 
 class ScreenshotTool(Tool):
     """Capture a screenshot of the current desktop screen."""
+
+    def __init__(self, environment: Environment | None = None):
+        self._environment = environment
 
     @property
     def name(self) -> str:
@@ -25,7 +30,23 @@ class ScreenshotTool(Tool):
         return {"type": "object", "properties": {}, "required": []}
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        """Take a DPR-aware screenshot and return it."""
+        """Take a screenshot and return it."""
+        try:
+            if self._environment is not None:
+                b64 = await self._environment.screenshot()
+                # Persist to a temp file so media attachments work the same way.
+                path = Path(tempfile.gettempdir()) / "syll_gui" / "screenshot.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(base64.b64decode(b64))
+                return ToolResult(text="Screenshot captured.", media=[str(path)])
+
+            return await self._legacy_screenshot()
+        except Exception as e:
+            logger.error(f"Screenshot failed: {e}")
+            return ToolResult(text=f"Error: Failed to capture screenshot: {e}")
+
+    async def _legacy_screenshot(self) -> ToolResult:
+        """Original local-desktop screenshot path."""
         try:
             import mss
             from PIL import Image

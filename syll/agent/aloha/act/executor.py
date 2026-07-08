@@ -1,7 +1,9 @@
 """Executor: converts high-level actions into GUI operations.
 
 Adapted from ShowUI-Aloha/Aloha_Act/ui_aloha/execute/executor/aloha_executor.py.
-Uses a shared mouse backend layer so macOS can switch away from raw pyautogui clicks.
+Uses a shared mouse backend layer so macOS can switch away from raw pyautogui clicks,
+and now operates on an :class:`syll.sandbox.environment.Environment` so the same
+execution code can target the local desktop or a future sandbox container.
 """
 
 import asyncio
@@ -21,6 +23,7 @@ from syll.agent.gui_click import (
     resolve_click_count,
     should_open_desktop_app_with_shortcut,
 )
+from syll.sandbox.environment import Environment, LocalEnvironment
 
 
 class AlohaExecutor:
@@ -48,15 +51,28 @@ class AlohaExecutor:
         "CONTINUE",
     }
 
-    def __init__(self, gui_config: Any | None = None):
+    def __init__(
+        self,
+        gui_config: Any | None = None,
+        environment: Environment | None = None,
+    ):
         self._config = gui_config
+        self._environment = environment or LocalEnvironment()
 
     async def execute(self, action_dict: dict) -> tuple[bool, str]:
         """Execute a single action dict from actor output."""
-        import pyautogui
+        if self._environment is None:
+            return False, "Environment not configured"
 
-        pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.3
+        # Local-only pyautogui safety settings. Harmless when the environment is
+        # a sandbox; the actual pointer operations go through ``self._environment``.
+        try:
+            import pyautogui
+
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = 0.3
+        except Exception:
+            pass
 
         action_name = str(action_dict.get("action", "")).upper()
         value = action_dict.get("value", "")
@@ -69,26 +85,26 @@ class AlohaExecutor:
             return False, f"Unsupported action: {action_name}"
 
         try:
-            return await self._dispatch(pyautogui, action_name, position, value, action_dict)
+            return await self._dispatch(action_name, position, value, action_dict)
         except Exception as exc:
             logger.error(f"Executor error: {exc}")
             return False, str(exc)
 
     async def _dispatch(
         self,
-        pyautogui: Any,
         action: str,
         position: list | None,
         value: str,
         raw: dict,
     ) -> tuple[bool, str]:
+        env = self._environment
         if action == "CLICK":
             if not position:
                 return False, "CLICK requires position"
             x, y = int(position[0]), int(position[1])
             if should_open_desktop_app_with_shortcut(action, raw):
                 message = await open_desktop_app_with_shortcut(
-                    pyautogui,
+                    env,
                     x,
                     y,
                     raw=raw,
@@ -97,7 +113,7 @@ class AlohaExecutor:
                 return True, message
             click_count = resolve_click_count(action, raw)
             message = await perform_click_sequence(
-                pyautogui,
+                env,
                 x,
                 y,
                 click_count,
@@ -110,7 +126,7 @@ class AlohaExecutor:
             if not position:
                 return False, "RIGHT_CLICK requires position"
             message = await perform_right_click(
-                pyautogui,
+                env,
                 int(position[0]),
                 int(position[1]),
                 raw=raw,
@@ -124,7 +140,7 @@ class AlohaExecutor:
             x, y = int(position[0]), int(position[1])
             if should_open_desktop_app_with_shortcut(action, raw):
                 message = await open_desktop_app_with_shortcut(
-                    pyautogui,
+                    env,
                     x,
                     y,
                     raw=raw,
@@ -132,7 +148,7 @@ class AlohaExecutor:
                 )
                 return True, message
             message = await perform_click_sequence(
-                pyautogui,
+                env,
                 x,
                 y,
                 2,
@@ -146,7 +162,7 @@ class AlohaExecutor:
                 return False, "TRIPLE_CLICK requires position"
             x, y = int(position[0]), int(position[1])
             message = await perform_click_sequence(
-                pyautogui,
+                env,
                 x,
                 y,
                 3,
@@ -159,10 +175,7 @@ class AlohaExecutor:
             text = value or raw.get("text", "")
             if not text:
                 return False, "TYPE requires value/text"
-            if text.isascii():
-                pyautogui.typewrite(text, interval=0.02)
-            else:
-                self._type_unicode(text)
+            await env.type(text)
             return True, f"Typed: {text[:50]}"
 
         if action in ("KEY", "HOTKEY"):
@@ -172,27 +185,26 @@ class AlohaExecutor:
                 normalized = normalize_hotkey_sequence(str(key))
                 if not normalized:
                     continue
-                if len(normalized) >= 2:
-                    pyautogui.hotkey(*normalized)
-                    pressed_sequences.append("+".join(normalized))
-                else:
-                    pyautogui.press(normalized[0])
-                    pressed_sequences.append(normalized[0])
+                # Pass a chord spec so the Environment can hotkey multi-modifier
+                # sequences instead of pressing keys sequentially.
+                spec = "+".join(normalized) if len(normalized) >= 2 else normalized[0]
+                await env.keypress(spec)
+                pressed_sequences.append(spec)
             return True, f"Pressed: {', '.join(pressed_sequences) or value}"
 
         if action == "ENTER":
-            pyautogui.press("enter")
+            await env.keypress("enter")
             return True, "Pressed Enter"
 
         if action in ("ESC", "ESCAPE"):
-            pyautogui.press("escape")
+            await env.keypress("escape")
             return True, "Pressed Escape"
 
         if action in ("MOVE", "HOVER"):
             if not position:
                 return False, "MOVE requires position"
             message = await perform_move(
-                pyautogui,
+                env,
                 int(position[0]),
                 int(position[1]),
                 raw=raw,
@@ -215,7 +227,7 @@ class AlohaExecutor:
                     break
             if start and end:
                 message = await perform_drag(
-                    pyautogui,
+                    env,
                     start,
                     end,
                     raw=raw,
@@ -224,7 +236,7 @@ class AlohaExecutor:
                 return True, message
             if position:
                 message = await perform_press(
-                    pyautogui,
+                    env,
                     int(position[0]),
                     int(position[1]),
                     raw=raw,
@@ -246,7 +258,9 @@ class AlohaExecutor:
             x, y = 0, 0
             if position:
                 x, y = int(position[0]), int(position[1])
-            pyautogui.scroll(-scroll_y, x=x, y=y)
+            # Legacy parity: the original code called ``pyautogui.scroll(-scroll_y,
+            # x=x, y=y)``; pass the negated value through the Environment.
+            await env.scroll(x, y, scroll_x=0, scroll_y=-scroll_y)
             direction = "up" if scroll_y > 0 else "down"
             return True, f"Scrolled {direction} {abs(scroll_y)} at ({x}, {y})"
 
@@ -255,7 +269,7 @@ class AlohaExecutor:
                 return False, "PRESS requires position"
             duration = float(raw.get("duration", raw.get("hold", 1.0)))
             message = await perform_press(
-                pyautogui,
+                env,
                 int(position[0]),
                 int(position[1]),
                 raw=raw,
@@ -280,22 +294,3 @@ class AlohaExecutor:
             return True, f"{action} acknowledged"
 
         return False, f"Unhandled action: {action}"
-
-    @staticmethod
-    def _type_unicode(text: str) -> None:
-        """Type unicode text using pyperclip + paste shortcut."""
-        try:
-            import pyautogui
-            import pyperclip
-
-            pyperclip.copy(text)
-            if platform.system() == "Darwin":
-                pyautogui.hotkey("command", "v")
-            else:
-                pyautogui.hotkey("ctrl", "v")
-        except ImportError:
-            import pyautogui
-
-            for ch in text:
-                if ch.isascii():
-                    pyautogui.press(ch)

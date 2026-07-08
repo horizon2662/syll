@@ -25,6 +25,11 @@ class RunnerConfig:
     max_subagent_iterations: int = 12
     max_replans_per_step: int = 2
     compaction_threshold: int = 20  # notes lines before the orchestrator compacts
+    # --- verifier-ceiling experiment knobs (defaults preserve original behavior) ---
+    recovery_mode: str = "replan"  # replan | retry_same_node | retry_then_replan
+    retry_context: str = "fresh"   # fresh | replay  (A1 context-sovereignty switch)
+    max_retries_per_step: int = 3  # only used when recovery_mode includes retry
+    context_window: int = 0  # input-token budget for the detector (0 = litellm lookup); SYLL_CONTEXT_WINDOW
 
     @classmethod
     def from_env(
@@ -46,6 +51,10 @@ class RunnerConfig:
             or os.environ.get("SYLL_API_BASE") or None,
             workspace=Path(workspace) if workspace else Path.home() / ".syll",
             skill=skill,
+            recovery_mode=os.environ.get("SYLL_RECOVERY_MODE", "replan"),
+            retry_context=os.environ.get("SYLL_RETRY_CONTEXT", "fresh"),
+            max_retries_per_step=int(os.environ.get("SYLL_MAX_RETRIES", "3")),
+            context_window=int(os.environ.get("SYLL_CONTEXT_WINDOW", "0")),
         )
 
     @property

@@ -22,6 +22,7 @@ def create_app(
     session_manager,
     skills_loader,
     memory_store,
+    workspace_memory_store=None,
     cron_service=None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
@@ -31,7 +32,8 @@ def create_app(
         agent_loop: AgentLoop instance for processing messages.
         session_manager: SessionManager instance.
         skills_loader: SkillsLoader instance.
-        memory_store: MemoryStore instance.
+        memory_store: Primary MemoryStore instance (user-scoped global memory).
+        workspace_memory_store: Optional MemoryStore for workspace-local memory.
         cron_service: Optional CronService. If provided, its lifecycle will be
             managed by the FastAPI lifespan, and its on_job / on_complete
             callbacks will be wrapped to broadcast WebSocket events.
@@ -145,6 +147,7 @@ def create_app(
     app.state.session_manager = session_manager
     app.state.skills_loader = skills_loader
     app.state.memory_store = memory_store
+    app.state.workspace_memory_store = workspace_memory_store
 
     # GUI Skill store
     from syll.agent.gui_skill import GUISkillStore
@@ -160,6 +163,9 @@ def create_app(
     from syll.recorder.manager import RecorderManager
 
     app.state.recorder_manager = RecorderManager()
+    from syll.web.runs_manager import RunsManager
+
+    app.state.runs_manager = RunsManager(config.workspace_path)
     app.state.cron_service = cron_service
 
     # Intent clarifier for the Syll panel. Reuses the live
@@ -287,6 +293,7 @@ def create_app(
     from syll.web.routes.recorded_skills import router as recorded_skills_router
     from syll.web.routes.recorder import router as recorder_router
     from syll.web.routes.rituals import router as rituals_router
+    from syll.web.routes.runs import router as runs_router
     from syll.web.routes.sessions import router as sessions_router
     from syll.web.routes.skills import router as skills_router
     from syll.web.routes.status import router as status_router
@@ -316,6 +323,7 @@ def create_app(
     app.include_router(coord_router, prefix="/api/v1")
     app.include_router(cron_router, prefix="/api/v1")
     app.include_router(rituals_router, prefix="/api/v1")
+    app.include_router(runs_router, prefix="/api/v1")
     app.include_router(voice_router, prefix="/api/v1")
     app.include_router(intent_router, prefix="/api/v1")
 

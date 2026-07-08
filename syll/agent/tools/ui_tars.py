@@ -20,12 +20,14 @@ import mimetypes
 import re
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from syll.agent.events import Event, EventContent, EventSource, EventStore
+from syll.agent.gui.primitive import UITarsPrimitive
 from syll.agent.gui_click import (
     normalize_hotkey_sequence,
     open_desktop_app_with_shortcut,
@@ -36,6 +38,7 @@ from syll.agent.gui_click import (
     should_open_desktop_app_with_shortcut,
 )
 from syll.agent.tools.base import Tool, ToolResult
+from syll.sandbox.environment import Environment, LocalEnvironment
 
 UITARS_SYSTEM_PROMPT = """You are a GUI agent. You are given a screenshot of the current screen.
 You need to help the user accomplish their task by performing actions on the screen.
@@ -85,6 +88,45 @@ GUI_NO_RETRY_SUFFIX = (
     "Report the failure to the user and suggest alternatives. "
     "Do NOT call gui_action or gui_action_planned again for this task.]"
 )
+
+
+class GuiFailureKind(Enum):
+    """Why a UITarsTool.execute run ended in failure.
+
+    Determines whether the outcome is retryable (infrastructure/transient) or
+    a genuine GUI deadlock the same approach will not solve — which in turn
+    decides whether the GUI failure lock is written (Stage 2 ledger)."""
+
+    SCREENSHOT_FAIL = "screenshot_fail"     # screenshot capture failed (transient)
+    MODEL_CALL_FAIL = "model_call_fail"     # UI-TARS model/API call failed (transient)
+    STUCK = "stuck"                         # same action repeated MAX_REPEAT_ACTIONS (genuine)
+    ACTION_EXEC_FAIL = "action_exec_fail"   # action execution failed (genuine)
+    MAX_STEPS = "max_steps"                 # reached max steps without finishing (genuine)
+
+    @property
+    def retryable(self) -> bool:
+        # Transient/infrastructure failures: the caller may retry on a later
+        # turn once the underlying issue (API param, network, screen capture)
+        # is resolved. Genuine GUI failures are not retryable same-way.
+        return self in (GuiFailureKind.SCREENSHOT_FAIL, GuiFailureKind.MODEL_CALL_FAIL)
+
+
+def _retry_suffix(kind: GuiFailureKind) -> str:
+    """The model-facing suffix to append for a failure kind.
+
+    Transient failures get no suffix (the model may retry gui_action later);
+    genuine GUI deadlocks keep the do-not-retry instruction (until the
+    GuiAttemptLedger lock is cleared)."""
+    return "" if kind.retryable else GUI_NO_RETRY_SUFFIX
+
+
+# UI-TARS-2 / Qwen-VL / Doubao emit these action-name variants; normalize them
+# to the canonical names the executor branches expect.
+_UITARS_ACTION_ALIASES = {
+    "left_single": "click",
+    "left_double": "double_click",
+    "right_single": "right_click",
+}
 
 # Adaptive resolution tiers — sorted highest→lowest per aspect ratio.
 # _compute_model_size picks the highest tier that fits the screen,
@@ -160,17 +202,46 @@ class UITarsTool(Tool):
         gui_skill_store: Any = None,
         aloha_skill_store: Any = None,
         syll_config: Any = None,
+        environment: Environment | None = None,
     ):
         self._config = gui_config
         self._gui_skill_store = gui_skill_store
         self._aloha_skill_store = aloha_skill_store
         self._syll_config = syll_config
+        self._environment = environment or LocalEnvironment()
         self._screenshot_dir = Path(tempfile.gettempdir()) / "syll_gui"
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._retry = RetryConfig()
         self._event_store: EventStore | None = None
         self._model_img_size: tuple[int, int] = (0, 0)  # set by _take_screenshot
         self._monitor_launched = False
+        # LLMProvider cache: route actor calls through the shared provider so
+        # usage lands in ContextMeter. Requires syll_config (no litellm fallback).
+        self._actor_provider = None
+        if self._syll_config:
+            try:
+                from syll.providers.litellm_provider import LiteLLMProvider
+                _ep = self._syll_config.resolve_endpoint("actor")
+                if _ep.api_key:
+                    self._actor_provider = LiteLLMProvider(
+                        api_key=_ep.api_key, api_base=_ep.api_base
+                    )
+            except Exception:
+                pass
+        # Per-session GUI failure ledger (attached by AgentLoop each message via
+        # set_session_context, like MessageTool.set_context). None in tests / the
+        # subagent path → all ledger calls are skipped and behavior is as before.
+        self._gui_ledger: Any = None
+
+    def set_session_context(self, session_key: str) -> None:
+        """Attach a per-session GUI failure ledger.
+
+        Called every message by AgentLoop._wire_tool_contexts so genuine GUI
+        failures are recorded as addressable, clearable state — replacing the
+        un-addressable GUI_NO_RETRY_SUFFIX chat text as the lock source of truth.
+        """
+        from syll.agent.gui_failure_ledger import GuiAttemptLedger
+        self._gui_ledger = GuiAttemptLedger(session_key)
 
     @property
     def name(self) -> str:
@@ -249,11 +320,16 @@ class UITarsTool(Tool):
 
         Following UI-TARS-desktop pattern: each step's screenshot and model response
         are accumulated as conversation turns, so the model has full context.
+        The per-step logic is delegated to :class:`UITarsPrimitive`.
         """
         steps = max_steps or self._config.max_steps
-        conversations: list[Conversation] = []
         screenshots: list[str] = []  # file paths for returning to user
-        recent_actions: list[str] = []  # for stuck detection
+
+        primitive = UITarsPrimitive(
+            self,
+            conversations=[],
+            max_repeat_actions=MAX_REPEAT_ACTIONS,
+        )
 
         # Launch GUI monitor overlay
         self._monitor_launch()
@@ -269,7 +345,7 @@ class UITarsTool(Tool):
             if skill_name:
                 icl_turns = self._build_icl_context(skill_name)
                 if icl_turns:
-                    conversations.extend(icl_turns)
+                    primitive.add_icl_context(icl_turns)
                     logger.info(f"Injected {len(icl_turns)} ICL turns from skill '{skill_name}'")
 
             for step in range(1, steps + 1):
@@ -291,7 +367,7 @@ class UITarsTool(Tool):
                                          error="截图失败")
                     return ToolResult(
                         text="Error: Failed to capture screenshot after retries"
-                             + GUI_NO_RETRY_SUFFIX,
+                             + _retry_suffix(GuiFailureKind.SCREENSHOT_FAIL),
                     )
                 screenshots.append(screenshot_path)
 
@@ -299,79 +375,56 @@ class UITarsTool(Tool):
                 with open(screenshot_path, "rb") as f:
                     screenshot_b64 = base64.b64encode(f.read()).decode()
 
-                # Add screenshot as user turn WITH image dimensions
-                conversations.append(Conversation(
-                    role="user",
+                # --- Single UI-TARS primitive step ---
+                result = await primitive.step(
+                    instruction=instruction,
                     screenshot_b64=screenshot_b64,
-                    screenshot_mime=self._guess_image_mime(Path(screenshot_path)),
-                    img_size=self._model_img_size,  # ← inject dimensions
-                ))
-
-                # --- Call UI-TARS with retry (multi-turn conversation) ---
-                response_text = await self._call_uitars_with_retry(
-                    instruction, conversations
+                    screenshot_path=screenshot_path,
+                    img_size=self._model_img_size,
+                    step=step,
+                    max_steps=steps,
                 )
-                if not response_text:
+
+                if result.status == "error":
                     self._monitor_write(status="error", instruction=instruction,
                                          step=step, max_steps=steps,
                                          error="模型调用失败")
                     return ToolResult(
-                        text="Error: UI-TARS API call failed after retries"
-                             + GUI_NO_RETRY_SUFFIX,
+                        text=result.message + _retry_suffix(GuiFailureKind.MODEL_CALL_FAIL),
                         media=[screenshot_path],
                     )
 
-                # Parse response and add as assistant turn
-                thought, action_str = self._parse_response(response_text)
-                conversations.append(Conversation(
-                    role="assistant",
-                    text=response_text,
-                ))
-                logger.info(f"  Thought: {thought}")
-                logger.info(f"  Action: {action_str}")
-
-                # Update monitor with current action
-                self._monitor_write(
-                    status="running",
-                    instruction=instruction,
-                    step=step,
-                    max_steps=steps,
-                    action=action_str,
-                    thought=thought,
-                )
-
-                # --- Stuck detection ---
-                recent_actions.append(action_str)
-                if len(recent_actions) >= MAX_REPEAT_ACTIONS:
-                    last_n = recent_actions[-MAX_REPEAT_ACTIONS:]
-                    if all(a == last_n[0] for a in last_n):
-                        logger.warning(f"Stuck: same action repeated {MAX_REPEAT_ACTIONS} times")
-                        self._monitor_write(status="error", instruction=instruction,
-                                             step=step, max_steps=steps,
-                                             action=action_str, error=f"重复操作 {MAX_REPEAT_ACTIONS} 次")
-                        return ToolResult(
-                            text=f"GUI agent appears stuck — repeated action '{action_str}' "
-                                 f"{MAX_REPEAT_ACTIONS} times. The action may not be working."
-                                 + GUI_NO_RETRY_SUFFIX,
-                            media=[screenshot_path],
+                if result.status == "stuck":
+                    logger.warning(f"Stuck: same action repeated {MAX_REPEAT_ACTIONS} times")
+                    self._monitor_write(status="error", instruction=instruction,
+                                         step=step, max_steps=steps,
+                                         action=result.action, error=f"重复操作 {MAX_REPEAT_ACTIONS} 次")
+                    if self._gui_ledger:
+                        self._gui_ledger.record_failure(
+                            instruction=instruction, kind=GuiFailureKind.STUCK,
+                            reason=result.message, step=step,
                         )
+                    return ToolResult(
+                        text=f"GUI agent appears stuck — repeated action '{result.action}' "
+                             f"{MAX_REPEAT_ACTIONS} times. The action may not be working."
+                             + _retry_suffix(GuiFailureKind.STUCK),
+                        media=[screenshot_path],
+                    )
 
-                # Check for finished
-                finished_match = re.match(r"finished\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
-                if finished_match:
-                    summary = finished_match.group(1)
+                if result.status == "done":
+                    summary = result.summary
                     key_shots = self._key_screenshots(screenshots)
                     self._monitor_write(status="finished", instruction=instruction,
                                          step=step, max_steps=steps, action=f"完成: {summary}")
+                    if self._gui_ledger:
+                        self._gui_ledger.record_success(instruction=instruction)
                     return ToolResult(
                         text=f"GUI task completed: {summary}\n\nSteps taken: {step}",
                         media=key_shots,
                     )
 
-                # Check for call_user
-                call_user_match = re.match(r"call_user\((?:content=)?['\"]?(.+?)['\"]?\)", action_str)
-                if call_user_match:
-                    message = call_user_match.group(1)
+                if result.status == "call_user":
+                    message = result.message
                     self._monitor_write(status="running", instruction=instruction,
                                          step=step, max_steps=steps,
                                          action=f"请求人工介入: {message}")
@@ -380,18 +433,32 @@ class UITarsTool(Tool):
                         media=[screenshot_path],
                     )
 
-                # --- Execute action with retry ---
-                intent_text = "\n".join(part for part in (instruction, thought) if part)
-                success, msg = await self._execute_action_with_retry(action_str, intent_text=intent_text)
-                if not success:
+                if result.status == "exec_fail":
                     self._monitor_write(status="error", instruction=instruction,
                                          step=step, max_steps=steps,
-                                         action=action_str, error=msg)
+                                         action=result.action, error=result.message)
+                    if self._gui_ledger:
+                        self._gui_ledger.record_failure(
+                            instruction=instruction, kind=GuiFailureKind.ACTION_EXEC_FAIL,
+                            reason=result.message, step=step,
+                        )
                     return ToolResult(
-                        text=f"Action failed at step {step}: {msg}"
-                             + GUI_NO_RETRY_SUFFIX,
+                        text=f"Action failed at step {step}: {result.message}"
+                             + _retry_suffix(GuiFailureKind.ACTION_EXEC_FAIL),
                         media=[screenshot_path],
                     )
+
+                # proceed
+                logger.info(f"  Thought: {result.thought}")
+                logger.info(f"  Action: {result.action}")
+                self._monitor_write(
+                    status="running",
+                    instruction=instruction,
+                    step=step,
+                    max_steps=steps,
+                    action=result.action,
+                    thought=result.thought,
+                )
 
                 # Log GUI action event
                 if self._event_store:
@@ -400,12 +467,12 @@ class UITarsTool(Tool):
                         event_type="action",
                         source=EventSource(platform="desktop", chat_id="gui", user_id="system"),
                         content=EventContent(
-                            text=f"Instruction: {instruction}\nThought: {thought}\nAction: {action_str}",
+                            text=f"Instruction: {instruction}\nThought: {result.thought}\nAction: {result.action}",
                             media=[screenshot_path],
                             metadata={
                                 "step": step,
-                                "action": action_str,
-                                "thought": thought,
+                                "action": result.action,
+                                "thought": result.thought,
                                 "skill_name": skill_name,
                             },
                         ),
@@ -417,10 +484,15 @@ class UITarsTool(Tool):
             self._monitor_write(status="finished", instruction=instruction,
                                  step=steps, max_steps=steps,
                                  error=f"达到最大步数 {steps}")
+            if self._gui_ledger:
+                self._gui_ledger.record_failure(
+                    instruction=instruction, kind=GuiFailureKind.MAX_STEPS,
+                    reason=f"reached max steps ({steps}) without finishing", step=steps,
+                )
             return ToolResult(
                 text=f"GUI task reached max steps ({steps}) without completing. "
                      f"The task may not be complete — report this to the user."
-                     + GUI_NO_RETRY_SUFFIX,
+                     + _retry_suffix(GuiFailureKind.MAX_STEPS),
                 media=key_shots,
             )
         except Exception as e:
@@ -602,8 +674,6 @@ class UITarsTool(Tool):
         - Sliding window: only last N screenshots include base64 images
         """
         try:
-            import litellm
-
             messages: list[dict] = []
 
             # System message
@@ -657,27 +727,16 @@ class UITarsTool(Tool):
                         "content": conv.text,
                     })
 
-            # Determine model string from purpose-based config
             if self._syll_config:
-                ep = self._syll_config.resolve_endpoint("actor")
-                model = ep.litellm_model
-                api_key = ep.api_key or None
-                api_base = ep.api_base
+                model = self._syll_config.resolve_endpoint("actor").litellm_model
             else:
                 model = "ui-tars"
-                api_key = None
-                api_base = None
 
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                api_key=api_key,
-                api_base=api_base,
-                max_tokens=1024,
-                temperature=0.05,  # lower for more deterministic coordinate output
+            resp = await self._actor_provider.chat(
+                messages=messages, model=model,
+                max_tokens=1024, temperature=0.05,
             )
-
-            return response.choices[0].message.content
+            return resp.content
         except Exception as e:
             logger.error(f"UI-TARS API call failed: {e}")
             return None
@@ -785,14 +844,14 @@ class UITarsTool(Tool):
     def _build_aloha_icl(self, aloha_skill: Any, skill_name: str) -> list[Conversation]:
         """Build ICL turns from an Aloha recorded skill.
 
-        Uses AlohaTrace data (observation/think/action/expectation) when available
-        for richer in-context learning.
+        Prefers cropped keyframes (tighter framing = better grounding example)
+        and reconstructs click actions with the same open/focus→double-click
+        upgrade the executor applies at runtime (``resolve_click_count``), so
+        the in-context examples match what the model should actually emit.
         """
         turns: list[Conversation] = []
         for step in aloha_skill.steps:
-            kf_path = self._aloha_skill_store.get_keyframe_path(
-                skill_name, step.screenshot
-            )
+            kf_path = self._aloha_keyframe_path(skill_name, step)
             if not kf_path:
                 continue
 
@@ -800,7 +859,6 @@ class UITarsTool(Tool):
             screenshot_b64 = base64.b64encode(kf_data).decode()
             mime = self._guess_image_mime(kf_path)
 
-            # User turn with screenshot
             turns.append(Conversation(
                 role="user",
                 screenshot_b64=screenshot_b64,
@@ -808,18 +866,7 @@ class UITarsTool(Tool):
                 is_icl=True,
             ))
 
-            # Build assistant turn — prefer trace data, fall back to action fields
-            if step.trace:
-                thought = step.trace.think or step.trace.observation or ""
-                action_str = step.trace.action or ""
-            else:
-                act = step.action
-                thought = act.description or f"Execute {act.type}"
-                if act.coordinates:
-                    action_str = f"{act.type}(start='({act.coordinates[0]}, {act.coordinates[1]})')"
-                else:
-                    action_str = f"{act.type}()"
-
+            thought, action_str = self._aloha_icl_assistant_text(step)
             assistant_text = ""
             if thought:
                 assistant_text += f"Thought: {thought}\n"
@@ -832,6 +879,53 @@ class UITarsTool(Tool):
             ))
 
         return turns
+
+    def _aloha_keyframe_path(self, skill_name: str, step: Any):
+        """Resolve the keyframe for an ICL step: prefer the crop, fall back to
+        the full screenshot (e.g. when the crop wasn't recorded)."""
+        crop = getattr(step, "screenshot_crop", "") or ""
+        if crop:
+            path = self._aloha_skill_store.get_keyframe_path(skill_name, crop)
+            if path:
+                return path
+        return self._aloha_skill_store.get_keyframe_path(skill_name, step.screenshot)
+
+    def _aloha_icl_assistant_text(self, step: Any) -> tuple[str, str]:
+        """Build ``(thought, action_str)`` for one ICL assistant turn.
+
+        ``thought`` comes from the trace (think/observation) when available,
+        else the action description. ``action_str`` is the trace's action used
+        verbatim when it already looks like an action call; otherwise it is
+        reconstructed from coordinates with the open/focus→double-click upgrade
+        so examples match runtime click behavior."""
+        act = step.action
+        trace = step.trace
+        if trace and (trace.think or trace.observation):
+            thought = trace.think or trace.observation
+        else:
+            thought = act.description or f"Execute {act.type}"
+
+        trace_action = (trace.action or "") if trace else ""
+        if "(" in trace_action:
+            return thought, trace_action
+        if act.coordinates:
+            return thought, (
+                f"{self._icl_action_type(act)}"
+                f"(start='({act.coordinates[0]}, {act.coordinates[1]})')"
+            )
+        return thought, f"{act.type}()"
+
+    def _icl_action_type(self, act: Any) -> str:
+        """Action type for an ICL click example, upgrading to ``double_click``
+        when the description matches gui_click's open/focus/launch intent
+        patterns — consistency with runtime ``resolve_click_count``."""
+        if act.type in ("click", "left_click"):
+            try:
+                if resolve_click_count("click", {"description": act.description or ""}) >= 2:
+                    return "double_click"
+            except Exception:
+                pass
+        return act.type
 
     @staticmethod
     def _guess_image_mime(path: Path) -> str:
@@ -846,11 +940,10 @@ class UITarsTool(Tool):
     ) -> tuple[bool, str]:
         """Parse and execute a GUI action string.
 
-        Dispatches to gui_click backends (pyautogui / pynput / quartz).
-        Coordinates are scaled from model image space to screen space.
+        Dispatches through the configured ``Environment``. Coordinates are
+        scaled from model image space to screen space.
         """
-        import pyautogui
-
+        env = self._environment
         try:
             # Parse action name and argument string
             match = re.match(r"(\w+)\((.*)\)", action_str.strip(), re.DOTALL)
@@ -861,24 +954,28 @@ class UITarsTool(Tool):
             args_str = match.group(2)
             args = self._parse_action_args(args_str)
 
+            # Normalize UI-TARS-2 action-name aliases (left_single/left_double/
+            # right_single → canonical names the branches below expect).
+            action_name = _UITARS_ACTION_ALIASES.get(action_name, action_name)
+
             if action_name in ("click", "left_click", "double_click"):
                 start = args.get("start")
                 if not start:
                     return False, f"Missing start coordinates in: {action_str}"
                 x, y = self._parse_coords(start)
-                sx, sy = self._scale_to_screen(x, y)
+                sx, sy = await self._scale_to_screen(x, y)
 
                 # Check for macOS desktop app shortcut dispatch
                 raw = {"intent": intent_text, "action_text": action_str}
                 if should_open_desktop_app_with_shortcut(action_name, raw):
                     msg = await open_desktop_app_with_shortcut(
-                        pyautogui, sx, sy, raw=raw, config=self._config,
+                        env, sx, sy, raw=raw, config=self._config,
                     )
                     return True, msg
 
                 count = resolve_click_count(action_name, raw)
                 msg = await perform_click_sequence(
-                    pyautogui, sx, sy, count, raw=raw, config=self._config,
+                    env, sx, sy, count, raw=raw, config=self._config,
                 )
                 return True, msg
 
@@ -887,10 +984,10 @@ class UITarsTool(Tool):
                 if not start:
                     return False, f"Missing start coordinates in: {action_str}"
                 x, y = self._parse_coords(start)
-                sx, sy = self._scale_to_screen(x, y)
+                sx, sy = await self._scale_to_screen(x, y)
                 raw = {"intent": intent_text, "action_text": action_str}
                 msg = await perform_right_click(
-                    pyautogui, sx, sy, raw=raw, config=self._config,
+                    env, sx, sy, raw=raw, config=self._config,
                 )
                 return True, msg
 
@@ -901,24 +998,26 @@ class UITarsTool(Tool):
                     return False, f"Missing coordinates in: {action_str}"
                 sx, sy = self._parse_coords(start)
                 ex, ey = self._parse_coords(end)
-                sx, sy = self._scale_to_screen(sx, sy)
-                ex, ey = self._scale_to_screen(ex, ey)
+                sx, sy = await self._scale_to_screen(sx, sy)
+                ex, ey = await self._scale_to_screen(ex, ey)
                 raw = {"intent": intent_text, "action_text": action_str}
                 msg = await perform_drag(
-                    pyautogui, (sx, sy), (ex, ey), raw=raw, config=self._config,
+                    env, (sx, sy), (ex, ey), raw=raw, config=self._config,
                 )
                 return True, msg
 
             elif action_name == "type":
                 content = args.get("content", "")
-                pyautogui.write(content, interval=0.05)
+                await env.type(content)
                 return True, f"Typed: {content[:50]}"
 
             elif action_name == "hotkey":
                 key = args.get("key", "")
-                keys = normalize_hotkey_sequence(key)
-                pyautogui.hotkey(*keys)
-                return True, f"Pressed hotkey: {key}"
+                await env.keypress(key)
+                # Report the normalized keys so diagnostics match what was dispatched.
+                normalized = normalize_hotkey_sequence(key, os_name=env.os_type)
+                display = "+".join(normalized) if len(normalized) >= 2 else (normalized[0] if normalized else key)
+                return True, f"Pressed: {display}"
 
             elif action_name == "scroll":
                 start = args.get("start")
@@ -926,17 +1025,20 @@ class UITarsTool(Tool):
                 amount = int(args.get("amount", "3"))
                 if start:
                     x, y = self._parse_coords(start)
-                    sx, sy = self._scale_to_screen(x, y)
+                    sx, sy = await self._scale_to_screen(x, y)
                 else:
-                    sx, sy = pyautogui.position()
+                    try:
+                        import pyautogui
+                        sx, sy = pyautogui.position()
+                    except Exception:
+                        sx, sy = 0, 0
                 scroll_amount = amount if direction == "down" else -amount
-                pyautogui.scroll(scroll_amount, x=sx, y=sy)
+                await env.scroll(sx, sy, scroll_x=0, scroll_y=scroll_amount)
                 return True, f"Scrolled {direction} by {amount}"
 
             elif action_name == "wait":
                 seconds = float(args.get("seconds", "2"))
-                import asyncio
-                await asyncio.sleep(seconds)
+                await env.wait(int(seconds * 1000))
                 return True, f"Waited {seconds}s"
 
             elif action_name in ("call_user", "finished"):
@@ -969,19 +1071,45 @@ class UITarsTool(Tool):
 
     @staticmethod
     def _parse_coords(coord_str: str) -> tuple[int, int]:
-        """Parse coordinate string like '(960, 540)' into (x, y)."""
-        match = re.search(r"\((\d+)\s*,\s*(\d+)\)", coord_str)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        """Parse a coordinate string into (x, y).
+
+        Accepts the formats vision models actually emit:
+        - ``(960, 540)`` / ``[960, 540]`` / bare ``960, 540`` — comma-separated
+        - ``<point>960 540</point>`` — UI-TARS / Qwen-VL / Doubao point tags,
+          SPACE-separated (no comma)
+        - ints or floats, optional sign."""
+        s = str(coord_str)
+        # <|box_start|>(X Y)<|box_end|> tag form — UI-TARS-2 / Doubao native
+        m = re.search(
+            r"<\|box_start\|>\s*\(?\s*(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*\)?\s*<\|box_end\|>",
+            s, re.IGNORECASE,
+        )
+        if m:
+            return int(float(m.group(1))), int(float(m.group(2)))
+        # <point>X Y</point> tag form (space-separated) — Doubao/Qwen-VL emit this
+        m = re.search(
+            r"<point>\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*</point>",
+            s, re.IGNORECASE,
+        )
+        if m:
+            return int(float(m.group(1))), int(float(m.group(2)))
+        # comma-separated (parens / brackets / bare)
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", s)
+        if m:
+            return int(float(m.group(1))), int(float(m.group(2)))
         raise ValueError(f"Invalid coordinates: {coord_str}")
 
-    def _scale_to_screen(self, x: int, y: int) -> tuple[int, int]:
+    async def _scale_to_screen(self, x: int, y: int) -> tuple[int, int]:
         """Scale coordinates from model image space to screen space."""
+        screen_w, screen_h = await self._environment.get_screen_size()
+        # Models that emit 0-1000 normalized coords regardless of the image
+        # size shown (e.g. qwen3-vl) are scaled by /1000; native UI-TARS uses
+        # the screenshot's own dimensions.
+        if str(getattr(self._config, "coord_space", "pixel")).lower() == "normalized":
+            return int(x * screen_w / 1000), int(y * screen_h / 1000)
         model_w, model_h = self._model_img_size
         if model_w == 0 or model_h == 0:
             return x, y
-        import pyautogui
-        screen_w, screen_h = pyautogui.size()
         sx = int(x * screen_w / model_w)
         sy = int(y * screen_h / model_h)
         return sx, sy

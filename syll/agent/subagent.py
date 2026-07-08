@@ -1,20 +1,18 @@
 """Subagent manager for background task execution."""
 
 import asyncio
-import json
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from syll.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
+from syll.agent.tools.bundles import register_core_tools
 from syll.agent.tools.registry import ToolRegistry
-from syll.agent.tools.shell import ExecTool
-from syll.agent.tools.web import WebFetchTool, WebSearchTool
 from syll.bus.events import InboundMessage
 from syll.bus.queue import MessageBus
 from syll.providers.base import LLMProvider
+from syll.sandbox.environment import Environment
 
 if TYPE_CHECKING:
     from syll.agent.mcp import MCPManager
@@ -39,6 +37,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         mcp_manager: "MCPManager | None" = None,
+        environment: Environment | None = None,
     ):
         from syll.config.schema import ExecToolConfig
         self.provider = provider
@@ -49,6 +48,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.mcp_manager = mcp_manager
+        self.environment = environment
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._failure_counts: dict[str, int] = {}  # task label -> consecutive failures
         self._max_announce_retries = 1  # max retries for failed subagent announcements
@@ -105,17 +105,14 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            tools.register(ReadFileTool(allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(allowed_dir=allowed_dir))
-            tools.register(ListDirTool(allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
+            register_core_tools(
+                tools,
+                workspace=self.workspace,
                 restrict_to_workspace=self.restrict_to_workspace,
-            ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
-            tools.register(WebFetchTool())
+                exec_config=self.exec_config,
+                brave_api_key=self.brave_api_key,
+                environment=self.environment,
+            )
 
             # Phase 1c: propagate MCP tools whose servers opted into
             # `propagate_to_subagents`. Built fresh per spawn — no shared
@@ -145,60 +142,33 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
+            # Run agent loop (limited iterations) — shared primitive (L1).
+            # Behaviour matches the previous inline loop: tool calls execute
+            # until the model answers without one (or the budget is hit).
+            # Message formatting is now unified (incl. ToolResult.media).
+            from syll.agent.loop_core import run_tool_loop
 
-            while iteration < max_iterations:
-                iteration += 1
-
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                )
-
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    }
-                    reasoning_content = response.provider_extra.get("reasoning_content")
-                    if reasoning_content:
-                        assistant_message["reasoning_content"] = reasoning_content
-                    messages.append(assistant_message)
-
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
-                        logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
-
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
+            _loop = await run_tool_loop(
+                self.provider,
+                tools,
+                messages,
+                model=self.model,
+                max_iterations=15,
+            )
+            # Extract content regardless of stop_reason — budget-exhaustion should
+            # not discard the model's last response.  Matches loop.py _finalize_turn.
+            last_content = (
+                (_loop.final_response.content or "")
+                if _loop.final_response
+                else ""
+            )
+            if not last_content and _loop.final_response:
+                rc = _loop.final_response.provider_extra.get("reasoning_content")
+                if rc:
+                    last_content = rc[:2000]
+            if not last_content:
+                last_content = "Task completed but no final response was generated."
+            final_result = last_content
 
             logger.info(f"Subagent [{task_id}] completed successfully")
             await self._announce_result(task_id, label, task, final_result, origin, "ok")

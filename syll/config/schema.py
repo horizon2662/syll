@@ -53,7 +53,7 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration (non-model settings)."""
     workspace: str = "~/.syll/workspace"
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     temperature: float = 0.7
     max_tool_iterations: int = 20
 
@@ -74,6 +74,7 @@ class ModelEndpoint(BaseModel):
     model: str = ""
     api_key: str = ""
     api_base: str | None = None
+    context_window: int = 0  # max input tokens; feeds the context-budget detector. 0 = unknown -> litellm lookup.
 
     @property
     def litellm_model(self) -> str:
@@ -84,7 +85,8 @@ class ModelEndpoint(BaseModel):
           - /anthropic  →  anthropic/  (Anthropic Messages API)
           - openrouter  →  openrouter/ (OpenRouter)
           - localhost/127.0.0.1  →  openai/  (local OpenAI-compatible)
-          - (other)     →  no prefix (pass-through)
+          - (other)     →  no prefix (pass-through, OpenAI-compatible — e.g.
+                          Kimi /coding/v1, Volcengine Ark)
         """
         if not self.model:
             return self.model
@@ -109,6 +111,10 @@ class ModelEndpoint(BaseModel):
 
         # DashScope (Alibaba Cloud) OpenAI-compatible endpoint
         if "dashscope" in base and not self.model.startswith("openai/"):
+            return f"openai/{self.model}"
+
+        # Volcengine Ark (Doubao) OpenAI-compatible endpoint
+        if "volces.com" in base and not self.model.startswith("openai/"):
             return f"openai/{self.model}"
 
         return self.model
@@ -227,17 +233,82 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
+class GuiAgentConfig(BaseModel):
+    """Advanced GUI-agent behaviour configuration.
+
+    This groups the feature flags and tunables that used to live in the
+    standalone ``EnhancedConfig`` and ``RunnerConfig`` objects.  Keeping them
+    under ``tools.gui.agent`` makes the schema the single source of truth for
+    GUI automation configuration.
+    """
+
+    # Master switch for the enhanced pipeline.
+    all_enabled: bool = True
+
+    # Phase 1: TVAE verification
+    enable_tvae_verification: bool = True
+    enable_llm_verify: bool = True
+    enable_prompt_delta: bool = True
+
+    # Phase 2: Structured planning & memory
+    enable_plan_persistence: bool = True
+    enable_structured_memory: bool = True
+
+    # Phase 4: Semantic trace & spatial analysis
+    enable_semantic_trace: bool = True
+    enable_spatial_context: bool = True
+
+    # Tunables
+    max_consecutive_failures: int = 3
+    screenshot_delay_seconds: float = 1.0
+    pixel_diff_threshold: float = 0.005
+
+    # Long-horizon / recovery behaviour (migrated from RunnerConfig)
+    max_steps: int = 15
+    max_replans_per_step: int = 2
+    recovery_mode: str = "replan"
+    retry_context: str = "fresh"
+    max_retries_per_step: int = 3
+
+    class Config:
+        extra = "ignore"
+
+
 class GuiConfig(BaseModel):
-    """GUI agent configuration."""
+    """GUI automation primitive configuration."""
     enabled: bool = False
     executor: str = "pyautogui"  # pyautogui or cliclick
     click_backend: str = "auto"  # auto | quartz | pynput | pyautogui
     mac_click_style: str = "auto"  # auto | click | down_up
     preflight_permissions: bool = True
-    max_steps: int = 15
     confirm_destructive: bool = True
-    execution_mode: str = "planner"  # "icl" | "planner"
     selected_screen: int = 0  # Monitor index (0 = primary)
+    coord_space: str = "pixel"  # "pixel" (UI-TARS native) | "normalized" (0-1000, e.g. qwen3-vl)
+    screenshot_scale: str = "auto"  # auto | original | 1080p | 1440p | 2160p
+    monitor: bool = True  # GUI monitor overlay enabled
+    agent: GuiAgentConfig = Field(default_factory=GuiAgentConfig)
+
+    class Config:
+        extra = "ignore"
+
+
+class SandboxConfig(BaseModel):
+    """Resettable experiment sandbox (ENPIRE EN module).
+
+    When ``enabled``, tasks run inside the configured backend instead of on the
+    user's real machine, with snapshot reset + state-grounded verification. See
+    the ENPIRE×Aspire plan (plans/syll-syll-vivid-sifakis.md).
+    """
+
+    enabled: bool = False
+    backend: str = "docker"  # docker | e2b | vmware | local
+    image: str = ""  # OCI image (docker) / VM path (vmware) / E2B template name
+    reset_mode: str = "full"  # full | phase (ENPIRE phase-reset to hardest-step onset)
+    parallelism: int = 4  # rollout cap (ENPIRE: token cost super-linear beyond 4)
+    per_task_timeout: int = 3600  # seconds (ALE 5h cap; OpenComputer EVAL_SANDBOX_TIMEOUT)
+    # Task-family hard safety constraints (ENPIRE EN). Opaque to the schema —
+    # the safety layer interprets entries; a violation forces failure + reset.
+    safety: dict[str, str] = Field(default_factory=dict)
 
     class Config:
         extra = "ignore"
@@ -248,6 +319,7 @@ class ToolsConfig(BaseModel):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     gui: GuiConfig = Field(default_factory=GuiConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
@@ -427,6 +499,6 @@ class Config(BaseSettings):
         return self.models.chat.api_base
 
     class Config:
-        env_prefix = "SYLL_"
+        env_prefix = "SYLL__"
         env_nested_delimiter = "__"
         extra = "ignore"

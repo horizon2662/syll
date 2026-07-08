@@ -375,7 +375,7 @@ def test_streaming_builds_with_hinted_prompt_but_saves_raw_user_text(monkeypatch
             return messages
 
     class _Provider:
-        async def chat(self, messages, tools, model):
+        async def chat(self, messages, tools, model, max_tokens=None):
             seen["provider_messages"] = messages
             return SimpleNamespace(has_tool_calls=False, content="final")
 
@@ -395,6 +395,7 @@ def test_streaming_builds_with_hinted_prompt_but_saves_raw_user_text(monkeypatch
         model="stub",
         max_iterations=1,
         event_store=_EventStore(),
+        get_context_meter=lambda _session_key: None,
     )
 
     monkeypatch.setattr(

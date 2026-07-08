@@ -35,6 +35,7 @@
                     today: '',
                     files: []
                 },
+                memoryScope: 'merged',   // 'merged' | 'global' | 'workspace'
                 selectedDailyNote: null,
 
                 // Dashboard state (still loaded for /dashboard route; not shown on Memory tab)
@@ -229,6 +230,30 @@
                     auto_trace: false,
                 },
                 recorderEventSource: null,
+                // ── Runs (context audit) ──
+                runs: [],
+                runsSelectedId: null,
+                runsSelected: null,
+                runsCurve: [],
+                runsBlackboard: null,
+                runsChart: null,
+                runsEventSource: null,
+                // ── Performance (aggregate main vs subagent usage) ──
+                perfSummary: null,
+                perfError: '',
+                perfActions: [],
+                perfChart: null,
+                perfPoll: null,
+                // ── GUI pipeline launcher ──
+                guiTaskText: '',
+                guiRunning: false,
+                guiSession: null,
+                guiAuditDir: null,
+                guiDone: false,
+                guiCancelled: false,
+                guiError: null,
+                guiBlackboard: null,
+                guiPoll: null,
                 recorderStarting: false,
                 recorderStopping: false,
                 recorderImporting: false,
@@ -283,7 +308,7 @@
                 async init() {
                     // Restore theme from localStorage
                     const saved = localStorage.getItem('syll-theme')
-                        ?? localStorage.getItem('nanobot-theme');
+                        ?? localStorage.getItem('syll-theme');
                     if (saved === 'light') {
                         this.darkMode = false;
                         document.documentElement.setAttribute('data-theme', 'light');
@@ -325,7 +350,7 @@
                     // Restore last 3 dashboard intents
                     try {
                         const h = localStorage.getItem('syll-intent-history')
-                            ?? localStorage.getItem('nanobot-intent-history');
+                            ?? localStorage.getItem('syll-intent-history');
                         if (h) this.intentHistory = JSON.parse(h) || [];
                     } catch (e) {}
                     // Global shortcuts: ⌘. toggle dashboard, ⌘M mic
@@ -1025,7 +1050,7 @@
 
                 async loadMemory() {
                     try {
-                        const response = await fetch('/api/v1/memory');
+                        const response = await fetch(`/api/v1/memory?scope=${this.memoryScope}`);
                         if (response.ok) {
                             const data = await response.json();
                             this.memory = {
@@ -1793,6 +1818,25 @@
                     }
                 },
 
+                async clearGuiLocks(sessionKey) {
+                    // Revision door for the revisable GUI failure memory: clears
+                    // genuine-failure locks so the model can retry gui_action.
+                    try {
+                        const response = await fetch(`/api/v1/gui-locks/${encodeURIComponent(sessionKey)}`, {
+                            method: 'DELETE'
+                        });
+                        if (response.ok) {
+                            const data = await response.json().catch(() => ({}));
+                            this.showToast(`Cleared ${data.cleared || 0} GUI lock(s) — gui_action can be retried`, 'success');
+                        } else {
+                            this.showToast('Failed to clear GUI locks', 'error');
+                        }
+                    } catch (e) {
+                        console.error('Failed to clear GUI locks:', e);
+                        this.showToast('Failed to clear GUI locks', 'error');
+                    }
+                },
+
                 openSession(sessionKey) {
                     this.switchTab('chat');
                     this.loadSession(sessionKey);
@@ -1923,7 +1967,7 @@
 
                 async viewDailyNote(filename) {
                     try {
-                        const response = await fetch(`/api/v1/memory/${encodeURIComponent(filename)}`);
+                        const response = await fetch(`/api/v1/memory/${encodeURIComponent(filename)}?scope=${this.memoryScope}`);
                         if (response.ok) {
                             this.selectedDailyNote = await response.json();
                         }
@@ -2131,6 +2175,15 @@
                     if (tab !== 'memory' && wasMemory) {
                         this.memoryStopPolling();
                     }
+                    if (tab !== 'runs') {
+                        this.disconnectRunsEvents();
+                    }
+                    if (tab !== 'performance') {
+                        this.stopPerfPolling();
+                    }
+                    if (tab !== 'gui') {
+                        this.stopGuiPoll();
+                    }
 
                     if (tab === 'sessions') {
                         this.loadSessions();
@@ -2154,6 +2207,10 @@
                         this.loadGuiSkills();
                         this.loadRecordedSkills();
                         this.loadRecorderStatus();
+                    } else if (tab === 'runs') {
+                        this.loadRuns();
+                    } else if (tab === 'performance') {
+                        this.loadPerformance();
                     } else if (tab === 'schedule') {
                         this.loadCronCapabilities();
                         this.loadScheduleJobs();
@@ -3224,6 +3281,246 @@
                     };
                 },
 
+                // ── Runs (context audit) ───────────────────────────────────
+                async loadRuns() {
+                    try {
+                        const r = await fetch('/api/v1/runs');
+                        if (r.ok) this.runs = await r.json();
+                    } catch (e) { console.error('loadRuns failed:', e); }
+                },
+
+                async selectRun(id) {
+                    this.runsSelectedId = id;
+                    this.disconnectRunsEvents();
+                    this.runsSelected = this.runs.find(x => x.id === id) || null;
+                    this.runsBlackboard = null;
+                    const dir = encodeURIComponent(id);
+                    const [curveR, bbR] = await Promise.all([
+                        fetch(`/api/v1/runs/curve?dir=${dir}`).then(r => r.ok ? r.json() : []).catch(() => []),
+                        fetch(`/api/v1/runs/blackboard?dir=${dir}`).then(r => r.ok ? r.json() : null).catch(() => null),
+                    ]);
+                    this.runsCurve = curveR;
+                    this.runsBlackboard = bbR;
+                    this.$nextTick(() => this.renderRunsChart());
+                    this.connectRunsEvents(id);
+                },
+
+                renderRunsChart() {
+                    const ctx = document.getElementById('runs-curve-chart');
+                    if (!ctx) return;
+                    if (this.runsChart) { this.runsChart.destroy(); }
+                    const pts = this.runsCurve;
+                    const budget = (this.runsSelected && this.runsSelected.budget_tokens) || 0;
+                    const labels = pts.map((p, i) => p.seq ?? (i + 1));
+                    const data = pts.map(p => p.prompt_tokens || 0);
+                    const pointColor = p => p.verdict === 'PASS' ? '#059669'
+                        : p.verdict === 'FAIL' ? '#ef4444' : '#9ca3af';
+                    const datasets = [{
+                        label: 'prompt_tokens',
+                        data,
+                        borderColor: '#9ca3af',
+                        fill: false,
+                        tension: 0.2,
+                        pointBackgroundColor: pts.map(pointColor),
+                        pointRadius: 3,
+                    }];
+                    if (budget) {
+                        datasets.push({
+                            label: 'budget',
+                            data: labels.map(() => budget),
+                            borderColor: '#f59e0b',
+                            borderDash: [6, 4],
+                            pointRadius: 0,
+                            fill: false,
+                        });
+                    }
+                    this.runsChart = new Chart(ctx, {
+                        type: 'line',
+                        data: { labels, datasets },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: { y: { beginAtZero: true } },
+                            plugins: { legend: { labels: { color: '#cbd5e1' } } },
+                        },
+                    });
+                },
+
+                connectRunsEvents(id) {
+                    this.disconnectRunsEvents();
+                    const es = new EventSource(`/api/v1/runs/stream?dir=${encodeURIComponent(id)}`);
+                    this.runsEventSource = es;
+                    es.addEventListener('point', (ev) => {
+                        try {
+                            const p = JSON.parse(ev.data);
+                            this.runsCurve.push(p);
+                            if (this.runsChart) {
+                                const c = p.verdict === 'PASS' ? '#059669'
+                                    : p.verdict === 'FAIL' ? '#ef4444' : '#9ca3af';
+                                this.runsChart.data.labels.push(p.seq ?? this.runsCurve.length);
+                                this.runsChart.data.datasets[0].data.push(p.prompt_tokens || 0);
+                                this.runsChart.data.datasets[0].pointBackgroundColor.push(c);
+                                this.runsChart.update('none');
+                            }
+                        } catch (e) {}
+                    });
+                    es.onerror = () => { this.disconnectRunsEvents(); };
+                },
+
+                disconnectRunsEvents() {
+                    if (this.runsEventSource) {
+                        this.runsEventSource.close();
+                        this.runsEventSource = null;
+                    }
+                },
+
+                fmtRuns(v) {
+                    if (v == null) return '–';
+                    if (typeof v === 'number') return isNaN(v) ? '–' : v.toFixed(3);
+                    return String(v);
+                },
+
+                // ── Performance (main vs subagent usage) ────────────────────
+                async loadPerformance() {
+                    this.perfError = '';
+                    try {
+                        const [r, ra] = await Promise.all([
+                            fetch('/api/v1/runs/performance'),
+                            fetch('/api/v1/runs/actions/recent?limit=20'),
+                        ]);
+                        if (r.ok) {
+                            this.perfSummary = await r.json();
+                        } else {
+                            this.perfError = 'HTTP ' + r.status + ' on /api/v1/runs/performance — '
+                                + (r.status === 404 ? 'route not registered → 重启 web server'
+                                   : r.status === 503 ? 'runs manager 未初始化 → 重启 web server'
+                                   : 'server error，看 server 日志');
+                        }
+                        if (ra.ok) this.perfActions = await ra.json();
+                    } catch (e) {
+                        this.perfError = 'fetch 失败：' + (e && e.message ? e.message : e);
+                        console.error('loadPerformance failed:', e);
+                    }
+                    this.$nextTick(() => this.renderPerfChart());
+                    this.startPerfPolling();
+                },
+
+                async loadPerformanceQuiet() {
+                    try {
+                        const [r, ra] = await Promise.all([
+                            fetch('/api/v1/runs/performance'),
+                            fetch('/api/v1/runs/actions/recent?limit=20'),
+                        ]);
+                        if (r.ok) this.perfSummary = await r.json();
+                        if (ra.ok) this.perfActions = await ra.json();
+                        if (this.perfChart && this.perfSummary) {
+                            const b = this.perfSummary.by_phase;
+                            this.perfChart.data.datasets[0].data = [
+                                b.main.prompt_tokens, b.sub.prompt_tokens, b.other.prompt_tokens,
+                            ];
+                            this.perfChart.update('none');
+                        }
+                    } catch (e) {}
+                },
+
+                renderPerfChart() {
+                    const ctx = document.getElementById('perf-chart');
+                    if (!ctx || !this.perfSummary) return;
+                    if (this.perfChart) { this.perfChart.destroy(); }
+                    const b = this.perfSummary.by_phase;
+                    this.perfChart = new Chart(ctx, {
+                        type: 'doughnut',
+                        data: {
+                            labels: ['main agent', 'subagent', 'other'],
+                            datasets: [{
+                                data: [b.main.prompt_tokens, b.sub.prompt_tokens, b.other.prompt_tokens],
+                                backgroundColor: ['#3b82f6', '#059669', '#9ca3af'],
+                            }],
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: { legend: { position: 'bottom', labels: { color: '#cbd5e1' } } },
+                        },
+                    });
+                },
+
+                startPerfPolling() {
+                    this.stopPerfPolling();
+                    this.perfPoll = setInterval(() => {
+                        if (this.activeTab === 'performance') this.loadPerformanceQuiet();
+                    }, 4000);
+                },
+
+                stopPerfPolling() {
+                    if (this.perfPoll) { clearInterval(this.perfPoll); this.perfPoll = null; }
+                },
+
+                fmtTok(n) { return (n || 0).toLocaleString(); },
+
+                // ── GUI pipeline launcher (option C: dedicated v3 entry) ─────
+                async startGuiRun() {
+                    const task = (this.guiTaskText || '').trim();
+                    if (!task || this.guiRunning) return;
+                    this.guiRunning = true; this.guiDone = false; this.guiCancelled = false; this.guiError = null;
+                    this.guiBlackboard = null; this.guiSession = null; this.guiAuditDir = null;
+                    try {
+                        const r = await fetch('/api/v1/runs/gui/run', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ task }),
+                        });
+                        if (!r.ok) {
+                            this.guiError = 'HTTP ' + r.status + ' — '
+                                + (r.status === 503 ? 'agent loop 不可用（重启 server）' : '启动失败');
+                            this.guiRunning = false; return;
+                        }
+                        const d = await r.json();
+                        this.guiSession = d.session; this.guiAuditDir = d.audit_dir;
+                        this.pollGuiRun();
+                    } catch (e) { this.guiError = String(e); this.guiRunning = false; }
+                },
+
+                async pollGuiRun() {
+                    this.stopGuiPoll();
+                    const tick = async () => {
+                        if (!this.guiSession) return;
+                        try {
+                            const s = await fetch('/api/v1/runs/gui/status?session=' + encodeURIComponent(this.guiSession)).then(r => r.ok ? r.json() : {});
+                            const bb = await fetch('/api/v1/runs/blackboard?dir=' + encodeURIComponent(this.guiAuditDir)).then(r => r.ok ? r.json() : null);
+                            this.guiBlackboard = bb;
+                            if (s.done) {
+                                this.guiDone = true; this.guiRunning = false;
+                                this.guiCancelled = !!s.cancelled;
+                                this.guiError = this.guiCancelled ? null : (s.error || null);
+                                this.stopGuiPoll(); return;
+                            }
+                        } catch (e) {}
+                        if (this.activeTab === 'gui') {
+                            this.guiPoll = setTimeout(tick, 1500);
+                        }
+                    };
+                    tick();
+                },
+
+                stopGuiPoll() {
+                    if (this.guiPoll) { clearTimeout(this.guiPoll); this.guiPoll = null; }
+                },
+
+                async cancelGuiRun() {
+                    if (!this.guiSession || !this.guiRunning) return;
+                    try {
+                        await fetch('/api/v1/runs/gui/cancel?session=' + encodeURIComponent(this.guiSession),
+                            { method: 'POST' });
+                        // poll loop will pick up done+cancelled on the next tick
+                    } catch (e) { this.guiError = 'cancel 失败：' + e; }
+                },
+
+                async viewGuiInRuns() {
+                    this.switchTab('runs');
+                    await this.loadRuns();
+                    if (this.guiAuditDir) this.selectRun(this.guiAuditDir);
+                },
+
                 async loadRecorderStatus() {
                     try {
                         const response = await fetch('/api/v1/recorder/status');
@@ -3984,12 +4281,12 @@
 
                 syllInit() {
                     const savedVis = localStorage.getItem('syll-syll-visible')
-                        ?? localStorage.getItem('nanobot-syll-visible')
-                        ?? localStorage.getItem('nanobot-ghost-visible');
+                        ?? localStorage.getItem('syll-syll-visible')
+                        ?? localStorage.getItem('syll-ghost-visible');
                     if (savedVis === 'false') this.syllVisible = false;
                     const savedPos = localStorage.getItem('syll-syll-pos')
-                        ?? localStorage.getItem('nanobot-syll-pos')
-                        ?? localStorage.getItem('nanobot-ghost-pos');
+                        ?? localStorage.getItem('syll-syll-pos')
+                        ?? localStorage.getItem('syll-ghost-pos');
                     if (savedPos) {
                         try {
                             const pos = JSON.parse(savedPos);
@@ -4186,8 +4483,8 @@
                     // Prefer last dragged position if the user moved it.
                     try {
                         const saved = localStorage.getItem('syll-syll-panel-pos')
-                            ?? localStorage.getItem('nanobot-syll-panel-pos')
-                            ?? localStorage.getItem('nanobot-ghost-dashboard-pos');
+                            ?? localStorage.getItem('syll-syll-panel-pos')
+                            ?? localStorage.getItem('syll-ghost-dashboard-pos');
                         if (saved) {
                             const p = JSON.parse(saved);
                             if (Number.isFinite(p.x) && Number.isFinite(p.y)) {

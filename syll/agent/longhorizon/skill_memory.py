@@ -15,7 +15,9 @@ Ideas (see ROADMAP.md):
   blow up the subagent's context. A filesystem is competitive with vector
   stores (Letta: 74% LoCoMo), so we stay markdown -- no vector DB yet.
 
-Does **not** modify the original ``memory.py``.
+This implementation now delegates persistence to :class:`MemoryStore` with
+scope ``skill`` so that skill memory participates in the same storage
+abstraction as workspace/global memory.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from loguru import logger
+
+from syll.agent.memory import MemoryStore
 
 _DATE_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2})\]")
 
@@ -36,7 +40,13 @@ class SkillMemory:
         self.skill = skill
         self.dir = workspace / "skills" / skill
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.skill_file = self.dir / "SKILL.md"
+        # SKILL.md is the skill's long-term memory; system_prompt.md is metadata.
+        self._store = MemoryStore(
+            workspace,
+            scope="skill",
+            subdir=f"skills/{skill}",
+            memory_filename="SKILL.md",
+        )
         self.prompt_file = self.dir / "system_prompt.md"
 
     # ------------------------------------------------------------------
@@ -44,9 +54,7 @@ class SkillMemory:
     # ------------------------------------------------------------------
     def load(self) -> str:
         """Load the skill's procedural memory (empty if none yet)."""
-        if self.skill_file.exists():
-            return self.skill_file.read_text(encoding="utf-8").strip()
-        return ""
+        return self._store.read_long_term().strip()
 
     def load_prompt(self) -> str:
         if self.prompt_file.exists():
@@ -159,9 +167,8 @@ class SkillMemory:
             f"# Skill: {self.skill}\n\nProcedural memory (how-to + pitfalls).\n"
         )
         sep = "\n" if existing else ""
-        self.skill_file.write_text(
-            header + existing + sep + "\n".join(new_lines) + "\n",
-            encoding="utf-8",
+        self._store.write_long_term(
+            header + existing + sep + "\n".join(new_lines) + "\n"
         )
         logger.info(f"skill[{self.skill}] wrote {len(new_lines)} lesson(s) to SKILL.md")
         return len(new_lines)

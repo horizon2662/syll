@@ -43,6 +43,11 @@ def get_memory_path(workspace: Path | None = None) -> Path:
     return ensure_dir(ws / "memory")
 
 
+def get_global_memory_path() -> Path:
+    """Get the global user memory directory (~/.syll/global_memory)."""
+    return ensure_dir(get_data_path() / "global_memory")
+
+
 def get_skills_path(workspace: Path | None = None) -> Path:
     """Get the skills directory within the workspace."""
     ws = workspace or get_workspace_path()

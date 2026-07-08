@@ -14,16 +14,61 @@ import platform
 import re
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from loguru import logger
 
+from syll.agent.aloha.act.enhanced.step_context import ExecuteContext, StepContext
 from syll.agent.aloha.act.executor import AlohaExecutor
 from syll.agent.aloha.act.planner import AlohaPlanner
 from syll.agent.aloha.act.trajectory_manager import TrajectoryManager
 from syll.agent.aloha_gui_skill import AlohaSkillStore
 from syll.agent.events import Event, EventContent, EventSource, EventStore
+from syll.agent.gui.primitive import GuiPrimitive
 from syll.agent.tools.base import Tool, ToolResult
+from syll.sandbox.environment import Environment, LocalEnvironment
+
+# Coordinate extraction — handles every format vision models emit:
+# (x,y) / [x,y] / bare x,y (comma) AND <point>x y</point> (space, UI-TARS-2 /
+# Qwen-VL / Doubao). Floats and signs accepted; results coerced to int.
+_COORD_PAIR_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)")
+_POINT_TAG_RE = re.compile(
+    r"<point>\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*</point>", re.IGNORECASE
+)
+# UI-TARS-2 / Doubao box-token form: <|box_start|>(X Y)<|box_end|> — space-
+# separated, parens optional. Doubao emits this for click/drag coordinates.
+_BOX_TAG_RE = re.compile(
+    r"<\|box_start\|>\s*\(?\s*(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)\s*\)?\s*<\|box_end\|>",
+    re.IGNORECASE,
+)
+
+
+def _extract_coord_pairs(action_str: str) -> list[list[int]]:
+    """All (x, y) pairs in ``action_str`` (click→1, drag→2). Handles every
+    coordinate format vision models emit: ``<|box_start|>(X Y)<|box_end|>``,
+    ``<point>X Y</point>``, comma-separated ``(X,Y)``/``[X,Y]``/bare, AND
+    0-1 float fractions (e.g. doubao's ``(0.908, 0.762)`` → auto-scaled to
+    0-1000 so coordSpace="normalized" handles them).
+    Most-specific (space-separated tag forms) checked first."""
+    for pattern in (_BOX_TAG_RE, _POINT_TAG_RE, _COORD_PAIR_RE):
+        raw = [
+            (float(m.group(1)), float(m.group(2)))
+            for m in pattern.finditer(action_str)
+        ]
+        if raw:
+            # If ALL pairs are fractional values in [0, 1] (e.g. 0.908, 0.762),
+            # the model is using 0-1 normalized coords. Scale to 0-1000 so the
+            # existing coordSpace="normalized" transform handles them. Genuine
+            # pixel/0-1000 integer coords are unaffected (they're > 1).
+            if all(
+                0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+                and (x != int(x) or y != int(y))  # has a fractional part
+                for x, y in raw
+            ):
+                raw = [(x * 1000, y * 1000) for x, y in raw]
+            return [[int(x), int(y)] for x, y in raw]
+    return []
 
 
 class AlohaPlannerTool(Tool):
@@ -34,15 +79,18 @@ class AlohaPlannerTool(Tool):
         gui_config: Any,
         aloha_skill_store: AlohaSkillStore,
         syll_config: Any = None,
+        environment: Environment | None = None,
     ):
         self._config = gui_config
         self._aloha_skill_store = aloha_skill_store
         self._syll_config = syll_config
+        self._environment = environment or LocalEnvironment()
         self._screenshot_dir = Path(tempfile.gettempdir()) / "syll_gui_planner"
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._event_store: EventStore | None = None
         self._screen_offset: tuple[int, int] = (0, 0)
         self._model_img_size: tuple[int, int] = (0, 0)
+        self._primitive = GuiPrimitive(self)
 
     @property
     def name(self) -> str:
@@ -112,7 +160,6 @@ class AlohaPlannerTool(Tool):
         if skill.trajectory:
             guidance = traj_manager.get_trajectory_in_context(skill.trajectory)
         else:
-            # Build guidance from step descriptions
             guidance_steps = []
             for s in skill.steps:
                 desc = ""
@@ -147,114 +194,79 @@ class AlohaPlannerTool(Tool):
         )
 
         # Initialize executor
-        executor = AlohaExecutor(self._config)
+        executor = AlohaExecutor(self._config, environment=self._environment)
+
+        # Minimal step config understood by the L1 primitive (no TVAE, no prompt
+        # delta).  Values are getattr-safe in the primitive as well.
+        step_cfg = SimpleNamespace(
+            enable_llm_verify=False,
+            enable_prompt_delta=False,
+            screenshot_delay_seconds=getattr(self._config, "screenshot_delay_seconds", 0.5),
+        )
 
         screenshots: list[str] = []
         action_history: list[str] = []
         steps_log: list[dict] = []
 
+        exec_ctx = ExecuteContext(
+            cfg=step_cfg,
+            skill_name=skill_name,
+            instruction=instruction,
+            mode=mode,
+            planner_model=planner_model,
+            planner=planner,
+            verifier=None,
+            executor=executor,
+            spatial_analyzer=None,
+            structured_memory=None,
+            plan_manager=None,
+            plan=None,
+            screenshots=screenshots,
+            steps_log=steps_log,
+            action_history=action_history,
+        )
+
+        shot_idx = 0
+        last_action_type = ""
+
         for step in range(1, steps_limit + 1):
             logger.info(f"Planner step {step}/{steps_limit}: {instruction}")
 
-            # Take screenshot (Issue 9: uses selected_screen)
-            screenshot_path = await self._take_screenshot(step)
-            if not screenshot_path:
-                return ToolResult(text="Error: Failed to capture screenshot")
-            screenshots.append(screenshot_path)
+            step_ctx = StepContext(step=step, attempt=0)
+            status, result, _, _, shot_idx = await self._primitive.execute_single_step(
+                exec_ctx, step_ctx,
+                guidance=guidance, skill=skill,
+                failed_attempts=[],
+                last_verify_result=None,
+                last_action_type=last_action_type,
+                actor_model=planner_model,
+                os_name=os_name,
+                shot_idx=shot_idx,
+                instruction=instruction,
+                max_steps=steps_limit,
+            )
 
-            with open(screenshot_path, "rb") as f:
-                screenshot_b64 = base64.b64encode(f.read()).decode()
+            if status == "error":
+                return result
+            if status == "done":
+                return result
 
-            # Call Planner
-            try:
-                plan = await planner.plan(
-                    task=instruction,
-                    guidance_trajectory=guidance,
-                    screenshot_b64=screenshot_b64,
-                    action_history=action_history,
-                )
-            except Exception as e:
-                logger.error(f"Planner failed: {e}")
-                return ToolResult(
-                    text=f"Planner error at step {step}: {e}",
-                    media=[screenshot_path],
-                )
-
-            plan_action = plan.get("Action")
-            plan_observation = plan.get("Observation", "")
-            plan_reasoning = plan.get("Reasoning", "")
-            current_step = plan.get("Current Step", step)
-            original_plan_action = plan_action
-            plan_action = self._rewrite_forbidden_first_step_action(plan_action, step, skill)
-            if plan_action != original_plan_action:
-                logger.info(
-                    f"  Rewrote first-step plan action: {original_plan_action!r} -> {plan_action!r}"
-                )
-
-            logger.info(f"  Plan: step={current_step}, action={plan_action}")
-            logger.info(f"  Reasoning: {plan_reasoning}")
-
-            # Check if task is complete
-            if plan_action is None or plan_action == "null" or plan_action == "":
-                key_shots = self._key_screenshots(screenshots)
-                return ToolResult(
-                    text=f"GUI task completed via planner.\n\n"
-                         f"Steps taken: {step}\n"
-                         f"Final observation: {plan_observation}\n\n"
-                         f"Steps log:\n{json.dumps(steps_log, indent=2)}",
-                    media=key_shots,
-                )
-
-            # Call Actor to get concrete action
-            try:
-                action_dict, is_complete = await self._call_actor(
-                    mode, plan_action, screenshot_b64, os_name
-                )
-            except Exception as e:
-                logger.error(f"Actor failed: {e}")
-                return ToolResult(
-                    text=f"Actor error at step {step}: {e}",
-                    media=[screenshot_path],
-                )
-
-            if is_complete:
-                key_shots = self._key_screenshots(screenshots)
-                return ToolResult(
-                    text=f"GUI task completed by actor.\nSteps taken: {step}\n\n"
-                         f"Steps log:\n{json.dumps(steps_log, indent=2)}",
-                    media=key_shots,
-                )
-
-            model_position = None
-            executor_position = None
-
-            # Apply coordinate transform via unified service
-            if "position" in action_dict:
-                pos = action_dict["position"]
-                if isinstance(pos, list) and len(pos) == 2:
-                    model_position = [int(pos[0]), int(pos[1])]
-                    x, y = self._transform_coords(pos[0], pos[1], mode=mode)
-                    executor_position = [x, y]
-                    action_dict["position"] = executor_position
-
-            if plan_action:
-                action_dict["intent"] = plan_action
-                action_dict["plan"] = plan_action
-            action_dict["instruction"] = instruction
-
-            # Preserve explicit planner request for a double-click sequence.
-            if action_dict.get("action") == "CLICK" and plan_action:
-                normalized = plan_action.lower().replace("-", " ").replace("_", " ")
-                if "double click" in normalized or "双击" in plan_action:
-                    action_dict["click_count"] = 2
-                    logger.info("  Upgraded CLICK → 2 explicit clicks (planner requested)")
-
-            # Execute action
-            success, msg = await executor.execute(action_dict)
+            # proceed or retry: record step and continue.  AlohaPlannerTool does
+            # not run an inner retry loop; it lets the planner adapt next step.
+            plan_output = step_ctx.plan_output or {}
+            plan_action = step_ctx.plan_action
+            plan_reasoning = plan_output.get("Reasoning", "")
+            plan_observation = plan_output.get("Observation", "")
+            current_step = plan_output.get("Current Step", step)
+            action_dict = step_ctx.action_dict or {}
+            model_position = step_ctx.model_position
+            executor_position = step_ctx.executor_position
+            msg = step_ctx.executor_result
             click_backend = action_dict.get("click_backend")
             mac_accessibility = action_dict.get("mac_accessibility")
             event_style = action_dict.get("event_style")
             frontmost_app = action_dict.get("frontmost_app")
+
             action_history.append(
                 self._format_action_history(
                     plan_action,
@@ -268,7 +280,6 @@ class AlohaPlannerTool(Tool):
                 )
             )
 
-            # Issue 7: Record step log
             steps_log.append({
                 "step": step,
                 "plan": plan_action,
@@ -284,11 +295,9 @@ class AlohaPlannerTool(Tool):
                 "frontmost_app": frontmost_app,
             })
 
-            if not success:
+            if not msg or "failed" in msg.lower():
                 logger.warning(f"Action failed at step {step}: {msg}")
-                # Don't abort — let planner adapt
 
-            # Issue 1: Log event with agent_type="gui_agent"
             if self._event_store:
                 event = Event(
                     agent_type="gui_agent",
@@ -299,7 +308,7 @@ class AlohaPlannerTool(Tool):
                              f"Plan: {plan_action}\n"
                              f"Reasoning: {plan_reasoning}\n"
                              f"Result: {msg}",
-                        media=[screenshot_path],
+                        media=[step_ctx.screenshot_path] if step_ctx.screenshot_path else [],
                         metadata={
                             "step": step,
                             "plan_action": plan_action,
@@ -308,10 +317,10 @@ class AlohaPlannerTool(Tool):
                             "skill_name": skill_name,
                             "model_position": model_position,
                             "executor_position": executor_position,
-                            "click_backend": action_dict.get("click_backend"),
-                            "mac_accessibility": action_dict.get("mac_accessibility"),
-                            "event_style": action_dict.get("event_style"),
-                            "frontmost_app": action_dict.get("frontmost_app"),
+                            "click_backend": click_backend,
+                            "mac_accessibility": mac_accessibility,
+                            "event_style": event_style,
+                            "frontmost_app": frontmost_app,
                         },
                     ),
                 )
@@ -418,8 +427,14 @@ class AlohaPlannerTool(Tool):
 
             # UI-TARS: pass model image dims for reverse-scaling
             mw, mh = self._model_img_size
+            coord_space = str(getattr(self._config, "coord_space", "pixel")).lower()
+            actor_type = (
+                ActorType.NORMALIZED
+                if coord_space == "normalized"
+                else ActorType.UI_TARS
+            )
             actor = ActorSpace(
-                actor_type=ActorType.UI_TARS, api_width=mw, api_height=mh
+                actor_type=actor_type, api_width=mw, api_height=mh
             )
             result = service.model_to_executor(x, y, ctx, actor, profile)
             return result.executor_x, result.executor_y
@@ -437,8 +452,6 @@ class AlohaPlannerTool(Tool):
         self, plan_action: str, screenshot_b64: str
     ) -> tuple[dict, bool]:
         """Use UI-TARS as actor: send plan action + screenshot, get concrete action."""
-        import litellm
-
         # Issue 8: Load system prompt from template file, with hardcoded fallback
         system_prompt = self._load_actor_system_prompt()
 
@@ -447,30 +460,55 @@ class AlohaPlannerTool(Tool):
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
         ]
 
-        # Resolve actor endpoint via purpose-based config
-        if self._syll_config:
-            ep = self._syll_config.resolve_endpoint("actor")
-            model = ep.litellm_model
-            api_key = ep.api_key or None
-            api_base = ep.api_base
+        # Resolve actor endpoint via purpose-based config — NO local-model
+        # fallback. If syll_config is missing, error clearly instead of
+        # silently calling a local ui-tars server.
+        if not self._syll_config:
+            raise RuntimeError(
+                "Actor endpoint not configured (syll_config missing). "
+                "Set models.actor in config.json — all GUI calls must go through the API."
+            )
+        ep = self._syll_config.resolve_endpoint("actor")
+        model = ep.litellm_model
+        api_key = ep.api_key or None
+        api_base = ep.api_base
+
+        actor_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        # 0b: route through a shared LLMProvider when one is attached so the
+        # call is observable; fall back to a bare litellm call otherwise.
+        actor_provider = getattr(self, "_actor_provider", None)
+        if actor_provider is not None:
+            resp = await actor_provider.chat(
+                messages=actor_messages,
+                model=model,
+                max_tokens=512,
+                temperature=0.1,
+            )
+            _on_actor_usage = getattr(self, "_on_actor_usage", None)
+            if _on_actor_usage is not None:
+                try:
+                    _on_actor_usage(resp)
+                except Exception:
+                    pass
+            if resp.finish_reason == "error" or not resp.content:
+                raise RuntimeError(resp.content or "LLM provider error")
+            response_text = resp.content
         else:
-            model = "ui-tars"
-            api_key = None
-            api_base = None
+            import litellm
 
-        response = await litellm.acompletion(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-            api_key=api_key,
-            api_base=api_base,
-            max_tokens=512,
-            temperature=0.1,
-        )
-
-        response_text = response.choices[0].message.content
+            response = await litellm.acompletion(
+                model=model,
+                messages=actor_messages,
+                api_key=api_key,
+                api_base=api_base,
+                max_tokens=512,
+                temperature=0.1,
+            )
+            response_text = response.choices[0].message.content
         action_str = self._parse_uitars_action(response_text)
 
         # Convert UI-TARS action string to action dict
@@ -526,17 +564,17 @@ class AlohaPlannerTool(Tool):
             return {"action": "ERROR", "value": "Needs human intervention", "position": [0, 0]}
 
         # Parse coordinates
-        coords = re.findall(r"\((\d+)\s*,\s*(\d+)\)", action_str)
+        coords = _extract_coord_pairs(action_str)
 
-        if action_str.startswith(("click(", "left_click(")):
+        if action_str.startswith(("click(", "left_click(", "left_single(")):
             if coords:
                 return {"action": "CLICK", "value": "", "position": [int(coords[0][0]), int(coords[0][1])]}
 
-        if action_str.startswith("right_click("):
+        if action_str.startswith(("right_click(", "right_single(")):
             if coords:
                 return {"action": "RIGHT_CLICK", "value": "", "position": [int(coords[0][0]), int(coords[0][1])]}
 
-        if action_str.startswith("double_click("):
+        if action_str.startswith(("double_click(", "left_double(")):
             if coords:
                 return {"action": "DOUBLE_CLICK", "value": "", "position": [int(coords[0][0]), int(coords[0][1])]}
 
@@ -629,3 +667,30 @@ class AlohaPlannerTool(Tool):
         if len(screenshots) == 1:
             return screenshots[:]
         return [screenshots[0], screenshots[-1]]
+
+    def _planner_label(self) -> str:
+        """Label used in completion messages."""
+        return "planner"
+
+    def _log_action(self, record: dict) -> None:
+        """Best-effort audit log; no-op for the base planner tool."""
+        pass
+
+    async def _finalize_plan(
+        self,
+        plan_manager: Any | None,
+        plan: Any | None,
+        structured_memory: Any | None,
+        current_step_num: int,
+        model: str,
+    ) -> None:
+        """No-op finalization for the base planner tool."""
+        pass
+
+    def _flush_skill_lessons(self, structured_memory: Any, skill_name: str) -> None:
+        """No-op skill-lesson flush for the base planner tool."""
+        pass
+
+    def _monitor_write(self, **kwargs: Any) -> None:
+        """No-op monitor overlay for the base planner tool."""
+        pass

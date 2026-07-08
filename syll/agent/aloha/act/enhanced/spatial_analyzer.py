@@ -34,10 +34,14 @@ class SpatialAnalyzer:
         model: str = "gpt-4o",
         api_key: str | None = None,
         api_base: str | None = None,
+        provider: Any = None,
+        on_usage: Any = None,
     ):
         self.model = model
         self.api_key = api_key
         self.api_base = api_base
+        self.provider = provider
+        self._on_usage = on_usage
 
     async def analyze(self, screenshot_b64: str) -> str:
         """Analyze a screenshot and return a structured UI description.
@@ -72,8 +76,6 @@ class SpatialAnalyzer:
         )
 
         try:
-            import litellm
-
             messages: list[dict[str, Any]] = [
                 {
                     "role": "user",
@@ -88,6 +90,24 @@ class SpatialAnalyzer:
                     ],
                 },
             ]
+
+            if self.provider is not None:
+                resp = await self.provider.chat(
+                    messages=messages,
+                    model=self.model,
+                    max_tokens=800,
+                    temperature=0,
+                )
+                if self._on_usage is not None:
+                    try:
+                        self._on_usage(resp)
+                    except Exception:
+                        pass
+                if resp.finish_reason == "error" or not resp.content:
+                    raise RuntimeError(resp.content or "LLM provider error")
+                return resp.content
+
+            import litellm
 
             kwargs: dict[str, Any] = dict(
                 model=self.model,

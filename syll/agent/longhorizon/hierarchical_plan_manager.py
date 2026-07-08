@@ -15,7 +15,7 @@ Two additions:
   unit, arXiv:2601.13671.)
 
 The parent's markdown ``execution_plan.md`` format is reused unchanged, so
-the existing GUIExecuteSubAgent can still read it. Milestones are encoded as
+the existing ``UnifiedSubagentManager`` can still read it. Milestones are encoded as
 ``[MILESTONE i]`` step headers.
 
 Does **not** modify the original ``plan_manager.py``.
@@ -24,7 +24,7 @@ Does **not** modify the original ``plan_manager.py``.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -37,7 +37,26 @@ from syll.agent.aloha.act.enhanced.plan_manager import (
     PlanStep,
 )
 
+# All PlanStep field names. checkpoint/resume round-trip every field via this
+# set, so adding a field to PlanStep can never silently drop on resume
+# (same bug class as R1). Deserialize filters to known keys, so old
+# checkpoints missing new fields still load (defaults apply).
+_PLANSTEP_FIELDS = {f.name for f in fields(PlanStep)}
+
 MilestoneStatus = Literal["PENDING", "CURRENT", "DONE", "FAILED", "SKIPPED"]
+
+# Compact glyphs for the text plan-progress view (render_progress). A linear
+# plan reads more precisely as TEXT than as an image — SeeRepo (arXiv:2606.14061)
+# shows visual graphs help localization of COMPLEX code dependency graphs but
+# are noise in validation; a plan is a sequence, not such a graph, so we render
+# structured text, not a graph image.
+_STATUS_GLYPH: dict[str, str] = {
+    "DONE": "✅",
+    "FAILED": "⚠",
+    "CURRENT": "🔹",
+    "SKIPPED": "⏭",
+    "PENDING": "⬜",
+}
 
 
 @dataclass
@@ -114,6 +133,66 @@ class HierarchicalPlanManager(PlanManager):
                 break
         return active_idx
 
+    def render_progress(
+        self,
+        plan: ExecutionPlan,
+        *,
+        focus_step_index: int | None = None,
+        last_diagnosis: str | None = None,
+        max_chars: int = 1500,
+    ) -> str:
+        """Compact text snapshot of the hierarchical plan for long-horizon
+        agents (subagent retry / orchestrator replan) — "where we are / what's
+        done / what failed / what's next" so the global thread is never lost.
+
+        Text, not an image: the plan is a linear sequence, not a complex
+        dependency graph, so text is denser and more precise than a rendered
+        graph would be (cf. SeeRepo arXiv:2606.14061). ``focus_step_index``
+        marks the step about to execute/retry; ``last_diagnosis`` annotates it
+        so a retrying subagent sees why the previous attempt failed in context.
+        """
+        if not plan or not plan.steps:
+            return ""
+
+        # Group steps under their [MILESTONE i] header.
+        groups: list[tuple[str, list[PlanStep]]] = []
+        title, bucket = "(before first milestone)", []
+        for step in plan.steps:
+            if step.description.lstrip().startswith("[MILESTONE"):
+                if bucket:
+                    groups.append((title, bucket))
+                title, bucket = step.description.strip(), []
+            else:
+                bucket.append(step)
+        groups.append((title, bucket))
+
+        total = sum(1 for t, _ in groups if "[MILESTONE" in t)
+        done = sum(
+            1 for t, ss in groups
+            if "[MILESTONE" in t and ss and all(s.status == "DONE" for s in ss)
+        )
+
+        lines = [
+            f"## Plan progress ({done}/{total} milestones done)",
+            f"Goal: {plan.task}",
+        ]
+        for title, steps in groups:
+            if not steps:
+                continue
+            lines.append("")
+            lines.append(title)
+            for s in steps:
+                glyph = "🔄" if s.index == focus_step_index else _STATUS_GLYPH.get(s.status, "⬜")
+                line = f"  {glyph} S{s.index}: {s.description.strip()}"
+                if s.index == focus_step_index and last_diagnosis:
+                    line += f"  ← last failure: {last_diagnosis.strip()[:160]}"
+                elif s.status == "FAILED" and s.result:
+                    line += f"  (failed: {s.result.strip()[:120]})"
+                elif s.status == "DONE" and s.result:
+                    line += f"  (ok: {s.result.strip()[:120]})"
+                lines.append(line)
+        return "\n".join(lines)[:max_chars]
+
     # ------------------------------------------------------------------
     # checkpoint / resume (the long-horizon piece)
     # ------------------------------------------------------------------
@@ -125,12 +204,7 @@ class HierarchicalPlanManager(PlanManager):
             "task": plan.task,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "steps": [
-                {
-                    "index": s.index,
-                    "description": s.description,
-                    "status": s.status,
-                    "result": s.result,
-                }
+                {k: getattr(s, k) for k in _PLANSTEP_FIELDS}
                 for s in plan.steps
             ],
         }
@@ -155,13 +229,11 @@ class HierarchicalPlanManager(PlanManager):
             steps=[],
         )
         for sd in state.get("steps", []):
+            # Filter to known PlanStep fields: old checkpoints missing new
+            # keys load via defaults; stale keys are ignored. Inverse of the
+            # serialize side, so no field is silently dropped on resume.
             plan.steps.append(
-                PlanStep(
-                    index=sd["index"],
-                    description=sd["description"],
-                    status=sd.get("status", "PENDING"),  # type: ignore[arg-type]
-                    result=sd.get("result", ""),
-                )
+                PlanStep(**{k: v for k, v in sd.items() if k in _PLANSTEP_FIELDS})
             )
         return plan
 

@@ -1,45 +1,22 @@
-"""Configuration for enhanced Aloha Act features.
+"""Configuration for the enhanced Aloha Act pipeline.
 
-Reads from ``~/.syll/config.json`` under the ``enhanced`` key.
-All flags default to ``True`` so the full enhanced pipeline is
-active out of the box even without a config file.
+Reads the ``enhanced`` section of ``~/.syll/config.json`` (see that file for
+the full key list). All flags default to ``True`` so the pipeline is active
+out of the box; set ``"allEnabled": false`` to disable everything.
 
 Usage::
 
-    # Everything on (default):
-    cfg = EnhancedConfig()
-
-    # Everything off:
-    cfg = EnhancedConfig.all_disabled()
-
-    # Pick and choose:
-    cfg = EnhancedConfig(enable_tvae_verification=True, enable_gui_subagent=False)
-
-Config file example (``~/.syll/config.json``)::
-
-    {
-      "enhanced": {
-        "allEnabled": true,
-        "enable_tvae_verification": true,
-        "enable_verified_planner": true,
-        "enable_prompt_delta": true,
-        "enable_plan_persistence": true,
-        "enable_structured_memory": true,
-        "enable_gui_subagent": true,
-        "enable_semantic_trace": true,
-        "enable_spatial_context": true,
-        "max_consecutive_failures": 3,
-        "screenshot_delay_seconds": 1.0,
-        "pixel_diff_threshold": 0.005
-      }
-    }
+    EnhancedConfig()                          # everything on (default)
+    EnhancedConfig.all_disabled()             # everything off
+    EnhancedConfig(enable_llm_verify=False)   # pick and choose
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import get_type_hints
 
 _CONFIG_FILE = Path.home() / ".syll" / "config.json"
 
@@ -75,41 +52,30 @@ class EnhancedConfig:
     ALL_ENABLED: bool = True
 
     # ---------- Phase 1: TVAE verification ----------
-    enable_tvae_verification: bool = True  # ActionVerifier pixel-diff + LLM check
-    enable_verified_planner: bool = True   # VerifiedPlanner (inherits AlohaPlanner)
-    enable_prompt_delta: bool = True       # Action-type-specific prompt hints
+    enable_tvae_verification: bool = True
+    enable_llm_verify: bool = True
+    enable_prompt_delta: bool = True
 
     # ---------- Phase 2: Structured planning & memory ----------
-    enable_plan_persistence: bool = True   # PlanManager (md file per skill)
-    enable_structured_memory: bool = True  # StructuredMemory (trajectory compression)
-
-    # ---------- Phase 3: Sub-agent execution ----------
-    enable_gui_subagent: bool = True       # GUIExecuteSubAgent (isolated TVAE loop)
+    enable_plan_persistence: bool = True
+    enable_structured_memory: bool = True
 
     # ---------- Phase 4: Semantic trace & spatial analysis ----------
-    enable_semantic_trace: bool = True     # EnhancedTraceGenerator
-    enable_spatial_context: bool = True    # SpatialAnalyzer (VLM UI description)
+    enable_semantic_trace: bool = True
+    enable_spatial_context: bool = True
 
     # ---------- Tunables ----------
     max_consecutive_failures: int = 3
     screenshot_delay_seconds: float = 1.0
     pixel_diff_threshold: float = 0.005
 
-    # ------------------------------------------------------------------
-    # Constructor: merge config.json values before applying overrides
-    # ------------------------------------------------------------------
-
     def __post_init__(self) -> None:
-        """When ALL_ENABLED is False, force every feature flag off."""
+        # ALL_ENABLED=False forces every boolean feature flag off (tunables kept).
         if not self.ALL_ENABLED:
-            self.enable_tvae_verification = False
-            self.enable_verified_planner = False
-            self.enable_prompt_delta = False
-            self.enable_plan_persistence = False
-            self.enable_structured_memory = False
-            self.enable_gui_subagent = False
-            self.enable_semantic_trace = False
-            self.enable_spatial_context = False
+            hints = get_type_hints(type(self))
+            for name, typ in hints.items():
+                if name != "ALL_ENABLED" and typ is bool:
+                    setattr(self, name, False)
 
     @classmethod
     def from_config_file(cls, **overrides) -> EnhancedConfig:
@@ -119,32 +85,13 @@ class EnhancedConfig:
         values, then built-in defaults.
         """
         file_vals = _load_enhanced_json()
-
-        # Map JSON key "allEnabled" → Python field "ALL_ENABLED"
+        # JSON key "allEnabled" maps to the ALL_ENABLED field.
         if "allEnabled" in file_vals:
             file_vals["ALL_ENABLED"] = file_vals.pop("allEnabled")
 
-        # Config file values fill in gaps; explicit overrides win
+        known = {f.name for f in fields(cls)}
         merged = {**file_vals, **overrides}
-
-        # Filter to only known fields
-        known = {
-            "ALL_ENABLED",
-            "enable_tvae_verification",
-            "enable_verified_planner",
-            "enable_prompt_delta",
-            "enable_plan_persistence",
-            "enable_structured_memory",
-            "enable_gui_subagent",
-            "enable_semantic_trace",
-            "enable_spatial_context",
-            "max_consecutive_failures",
-            "screenshot_delay_seconds",
-            "pixel_diff_threshold",
-        }
-        filtered = {k: v for k, v in merged.items() if k in known}
-
-        return cls(**filtered)
+        return cls(**{k: v for k, v in merged.items() if k in known})
 
     # ------------------------------------------------------------------
     # Convenience constructors
@@ -160,17 +107,24 @@ class EnhancedConfig:
         """Return a config with every feature turned off (original behaviour)."""
         return cls(ALL_ENABLED=False)
 
-    @property
-    def tvae_active(self) -> bool:
-        """Shortcut: are TVAE verification components active?"""
-        return self.enable_tvae_verification and self.enable_verified_planner
+    @classmethod
+    def from_gui_agent_config(cls, cfg: "GuiAgentConfig") -> EnhancedConfig:
+        """Build an EnhancedConfig from the canonical schema config.
 
-    @property
-    def phase2_active(self) -> bool:
-        """Shortcut: are plan persistence and structured memory active?"""
-        return self.enable_plan_persistence and self.enable_structured_memory
-
-    @property
-    def phase4_active(self) -> bool:
-        """Shortcut: are semantic trace and spatial analysis active?"""
-        return self.enable_semantic_trace and self.enable_spatial_context
+        This bridges the old standalone ``EnhancedConfig`` dataclass with the
+        new ``tools.gui.agent`` schema field, so existing code that consumes
+        EnhancedConfig continues to work while configuration converges.
+        """
+        return cls(
+            ALL_ENABLED=cfg.all_enabled,
+            enable_tvae_verification=cfg.enable_tvae_verification,
+            enable_llm_verify=cfg.enable_llm_verify,
+            enable_prompt_delta=cfg.enable_prompt_delta,
+            enable_plan_persistence=cfg.enable_plan_persistence,
+            enable_structured_memory=cfg.enable_structured_memory,
+            enable_semantic_trace=cfg.enable_semantic_trace,
+            enable_spatial_context=cfg.enable_spatial_context,
+            max_consecutive_failures=cfg.max_consecutive_failures,
+            screenshot_delay_seconds=cfg.screenshot_delay_seconds,
+            pixel_diff_threshold=cfg.pixel_diff_threshold,
+        )

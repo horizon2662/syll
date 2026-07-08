@@ -5855,6 +5855,9 @@
             <button class="tab-button" :class="{ 'active': activeTab === 'skills' }" @click="switchTab('skills')">Skills</button>
             <button class="tab-button" :class="{ 'active': activeTab === 'schedule' }" @click="switchTab('schedule')">Schedule</button>
             <button class="tab-button" :class="{ 'active': activeTab === 'demo' }" @click="switchTab('demo')">Demo</button>
+            <button class="tab-button" :class="{ 'active': activeTab === 'gui' }" @click="switchTab('gui')">GUI</button>
+            <button class="tab-button" :class="{ 'active': activeTab === 'runs' }" @click="switchTab('runs')">Runs</button>
+            <button class="tab-button" :class="{ 'active': activeTab === 'performance' }" @click="switchTab('performance')">Performance</button>
             <button class="tab-button" :class="{ 'active': activeTab === 'profile' }" @click="switchTab('profile')">Profile</button>
             <button class="tab-button" :class="{ 'active': activeTab === 'mcp' }" @click="switchTab('mcp')">MCP</button>
             <button class="tab-button" :class="{ 'active': activeTab === 'config' }" @click="switchTab('config')">Config</button>
@@ -7156,6 +7159,13 @@
                                                 continue
                                             </button>
                                             <button
+                                                class="action-btn"
+                                                @click="clearGuiLocks(session.key)"
+                                                title="Clear GUI failure locks so gui_action can be retried"
+                                            >
+                                                retry gui
+                                            </button>
+                                            <button
                                                 class="action-btn delete"
                                                 @click="confirm('forget this conversation? this cannot be undone.') && deleteSession(session.key)"
                                             >
@@ -7313,6 +7323,14 @@
                                     <p><em>one of them is still her name.</em></p>
                                 </div>
                                 <div class="memory-hero-stats" x-html="memoryStatLine()"></div>
+                                <div class="memory-scope-switch" style="margin-top:0.75rem; display:flex; justify-content:center; gap:0.5rem; align-items:center;">
+                                    <label for="memory-scope" class="memory-scope-label" style="font-size:0.75rem; color:var(--ink-tertiary);">remember</label>
+                                    <select id="memory-scope" class="memory-scope-select" x-model="memoryScope" @change="loadMemory()" style="font-size:0.75rem; padding:0.25rem 0.5rem; border-radius:0.375rem; border:1px solid var(--border); background:var(--surface);">
+                                        <option value="merged">everything of me</option>
+                                        <option value="global">me, across workspaces</option>
+                                        <option value="workspace">only this project</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
 
@@ -8965,6 +8983,252 @@ press save (or ⌘/ctrl + s) when you're done."></textarea>
                     </div>
                 </template>
             </div>
+        <!-- Runs Tab — context audit (curve + telemetry + plan) -->
+        <div class="tab-panel" :class="{ 'active': activeTab === 'runs' }">
+            <div style="display:flex; gap:14px; height:calc(100vh - 120px); min-height:420px;">
+                <aside style="width:300px; overflow:auto; border-right:1px solid var(--border, #333); flex-shrink:0;">
+                    <div style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
+                        <strong>Runs</strong>
+                        <button @click="loadRuns()" style="font-size:11px;">refresh</button>
+                    </div>
+                    <template x-for="r in runs" :key="r.id">
+                        <div @click="selectRun(r.id)"
+                             :style="(r.id === runsSelectedId) ? 'background:var(--accent-bg, rgba(255,255,255,0.06));' : ''"
+                             style="padding:9px 14px; cursor:pointer; border-top:1px solid rgba(255,255,255,0.04);">
+                            <div style="font-size:13px;" x-text="(r.session || r.id).slice(0, 40)"></div>
+                            <div style="font-size:11px; opacity:0.65;">
+                                <span x-text="r.kind"></span> ·
+                                <span x-text="r.n_points + ' pts'"></span> ·
+                                <span x-text="r.last_prompt_tokens != null ? r.last_prompt_tokens.toLocaleString() + ' tok' : '—'"></span>
+                            </div>
+                            <div x-show="r.utilization != null" style="font-size:11px;">
+                                util <span x-text="(r.utilization * 100).toFixed(1) + '%'"></span>
+                                <span x-show="r.over_budget" style="color:#ef4444; font-weight:600;">⚠ over budget</span>
+                            </div>
+                        </div>
+                    </template>
+                    <div x-show="runs.length === 0" style="padding:18px; opacity:0.55; font-size:13px;">
+                        No runs yet. Execute a task; curves appear at <code>workspace/audit/</code>.
+                    </div>
+                </aside>
+
+                <div style="flex:1; overflow:auto; padding:6px 10px;">
+                    <div x-show="runsSelected">
+                        <div style="display:flex; gap:8px; align-items:baseline; margin-bottom:4px;">
+                            <h3 style="margin:0;" x-text="runsSelected && (runsSelected.session || runsSelected.id)"></h3>
+                            <span style="font-size:11px; opacity:0.6;" x-text="runsSelected && runsSelected.kind"></span>
+                        </div>
+                        <div style="font-size:12px; margin-bottom:8px; opacity:0.9;">
+                            peak <b x-text="runsSelected && fmtTok(runsSelected.peak_prompt_tokens)"></b> /
+                            <span x-text="runsSelected && fmtTok(runsSelected.budget_tokens)"></span> tok
+                            (<b x-text="runsSelected && ((runsSelected.peak_utilization || 0) * 100).toFixed(1) + '%'"></b>) ·
+                            remaining <b style="color:#059669;" x-text="runsSelected && fmtTok(runsSelected.remaining_tokens)"></b> ·
+                            success <b x-text="runsSelected && (runsSelected.success_rate != null ? (runsSelected.success_rate * 100).toFixed(0) + '%' : '—')"></b>
+                            (<span style="color:#059669;" x-text="runsSelected && runsSelected.pass_count"></span>✓ / <span style="color:#ef4444;" x-text="runsSelected && runsSelected.fail_count"></span>✗)
+                        </div>
+                        <div style="position:relative; height:240px;">
+                            <canvas id="runs-curve-chart"></canvas>
+                        </div>
+
+                        <div style="margin-top:14px;" x-show="runsBlackboard && runsBlackboard.result">
+                            <h4 style="margin:2px 0;">Blackboard result</h4>
+                            <div style="font-size:12px; line-height:1.7;">
+                                <div>status: <b x-text="runsBlackboard.result.status"></b></div>
+                                <div x-show="runsBlackboard.result.summary">summary: <span x-text="runsBlackboard.result.summary"></span></div>
+                                <div x-show="runsBlackboard.result.diagnosis" style="color:#ef4444;">diagnosis: <span x-text="runsBlackboard.result.diagnosis"></span></div>
+                                <div x-show="runsBlackboard.result.iterations_used != null" style="opacity:0.7;">iterations: <span x-text="runsBlackboard.result.iterations_used"></span></div>
+                                <div x-show="runsBlackboard.result.artifacts && runsBlackboard.result.artifacts.length">
+                                    artifacts:
+                                    <template x-for="art in runsBlackboard.result.artifacts" :key="art">
+                                        <code x-text="art" style="margin-right:6px;"></code>
+                                    </template>
+                                </div>
+                                <div x-show="runsBlackboard.result.lessons && runsBlackboard.result.lessons.length">
+                                    lessons:
+                                    <ul style="margin:4px 0;">
+                                        <template x-for="lesson in runsBlackboard.result.lessons" :key="lesson">
+                                            <li x-text="lesson"></li>
+                                        </template>
+                                    </ul>
+                                </div>
+                                <div x-show="runsSelected && runsSelected.blackboard_rel" style="opacity:0.6; margin-top:4px;">
+                                    full result: <code x-text="runsSelected.blackboard_rel"></code>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div x-show="!runsSelected" style="opacity:0.55; padding:32px; text-align:center;">
+                        Select a run on the left.
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Performance Tab — aggregate main vs subagent usage -->
+        <div class="tab-panel" :class="{ 'active': activeTab === 'performance' }">
+            <div x-show="!perfSummary" style="padding:32px;">
+                <span x-show="!perfError" style="opacity:0.6;">Loading…</span>
+                <div x-show="perfError" style="color:#f59e0b; font-size:13px; line-height:1.6;">
+                    <b>Performance 加载失败：</b><br>
+                    <span x-text="perfError"></span>
+                </div>
+            </div>
+            <div x-show="perfSummary" style="padding:14px;">
+                <!-- context headroom + success rate (the "how much is left" chart) -->
+                <template x-if="perfSummary && perfSummary.context">
+                    <div style="display:flex; gap:24px; margin-bottom:16px; flex-wrap:wrap; align-items:flex-start;">
+                        <div style="flex:2; min-width:300px;">
+                            <div style="font-size:12px; opacity:0.7; margin-bottom:6px;">context window headroom — peak vs budget (worst any run reached)</div>
+                            <div style="background:rgba(255,255,255,0.08); border-radius:6px; height:24px; overflow:hidden;">
+                                <div :style="'width:' + ((perfSummary.context.peak_utilization || 0) * 100) + '%; height:100%; background:' + ((perfSummary.context.peak_utilization || 0) > 0.85 ? '#ef4444' : (perfSummary.context.peak_utilization || 0) > 0.6 ? '#f59e0b' : '#3b82f6') + ';'"
+                                     style="transition:width 0.4s ease;"></div>
+                            </div>
+                            <div style="font-size:12px; margin-top:6px;">
+                                peak <b x-text="fmtTok(perfSummary.context.peak_prompt_tokens)"></b> /
+                                <span x-text="fmtTok(perfSummary.context.budget_tokens)"></span> tok
+                                (<b x-text="((perfSummary.context.peak_utilization || 0) * 100).toFixed(1) + '%'"></b>) ·
+                                <span style="color:#059669;">remaining <b x-text="fmtTok(perfSummary.context.remaining_at_peak)"></b> tok</span>
+                            </div>
+                        </div>
+                        <div style="flex:1; min-width:180px; text-align:center; border-left:1px solid rgba(255,255,255,0.08); padding-left:18px;">
+                            <div style="font-size:12px; opacity:0.7;">verifier pass-rate</div>
+                            <div style="font-size:30px; font-weight:700; line-height:1.2;" x-text="perfSummary.success && perfSummary.success.rate != null ? (perfSummary.success.rate * 100).toFixed(1) + '%' : '—'"></div>
+                            <div style="font-size:12px; opacity:0.7;">
+                                <span style="color:#059669;" x-text="(perfSummary.success ? perfSummary.success.pass : 0) + ' pass'"></span> ·
+                                <span style="color:#ef4444;" x-text="(perfSummary.success ? perfSummary.success.fail : 0) + ' fail'"></span>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <div style="display:flex; gap:18px; flex-wrap:wrap; align-items:flex-start;">
+                    <div style="position:relative; width:260px; height:220px;">
+                        <canvas id="perf-chart"></canvas>
+                    </div>
+                    <div style="flex:1; min-width:300px;">
+                        <h3 style="margin:2px 0;">Context usage (prompt tokens)</h3>
+                        <template x-if="perfSummary">
+                            <div style="font-size:14px; line-height:2;">
+                                <div><span style="color:#3b82f6;">●</span> main agent:
+                                    <b x-text="fmtTok(perfSummary.by_phase.main.prompt_tokens)"></b> tok
+                                    (<span x-text="perfSummary.by_phase.main.calls"></span> calls ·
+                                    <span x-text="fmtTok(perfSummary.by_phase.main.completion_tokens)"></span> completion)</div>
+                                <div><span style="color:#059669;">●</span> subagent:
+                                    <b x-text="fmtTok(perfSummary.by_phase.sub.prompt_tokens)"></b> tok
+                                    (<span x-text="perfSummary.by_phase.sub.calls"></span> calls ·
+                                    <span x-text="fmtTok(perfSummary.by_phase.sub.completion_tokens)"></span> completion)</div>
+                                <div style="opacity:0.7; margin-top:4px;">
+                                    total prompt: <b x-text="fmtTok(perfSummary.total.prompt_tokens)"></b> tok ·
+                                    total completion: <b x-text="fmtTok(perfSummary.total.completion_tokens)"></b> tok ·
+                                    <span x-text="perfSummary.total.calls"></span> calls ·
+                                    <span x-text="perfSummary.n_runs"></span> runs
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
+                <h4 style="margin-top:18px;">Per run</h4>
+                <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                    <thead><tr style="text-align:left; opacity:0.7;">
+                        <th style="padding:4px;">run</th><th>kind</th>
+                        <th style="text-align:right;">peak (util)</th>
+                        <th style="text-align:right;">remaining</th>
+                        <th style="text-align:right;">success</th>
+                        <th style="text-align:right;">actions</th>
+                        <th style="text-align:right;">main tok</th>
+                        <th style="text-align:right;">sub tok</th>
+                    </tr></thead>
+                    <tbody>
+                        <template x-for="r in (perfSummary && perfSummary.per_run) || []" :key="r.id">
+                            <tr style="border-top:1px solid rgba(255,255,255,0.05);">
+                                <td style="padding:4px;" x-text="(r.session || r.id).slice(0,32)"></td>
+                                <td x-text="r.kind"></td>
+                                <td style="text-align:right;" x-text="r.peak_prompt_tokens ? fmtTok(r.peak_prompt_tokens) + ' (' + ((r.peak_prompt_tokens / (r.budget_tokens || 1)) * 100).toFixed(0) + '%)' : '—'"></td>
+                                <td style="text-align:right;" x-text="r.remaining_tokens != null ? fmtTok(r.remaining_tokens) : '—'"></td>
+                                <td style="text-align:right;" x-text="r.success_rate != null ? (r.success_rate * 100).toFixed(0) + '%' : '—'"></td>
+                                <td style="text-align:right;" x-text="r.actions || 0"></td>
+                                <td style="text-align:right;" x-text="fmtTok(r.orchestrator.prompt_tokens)"></td>
+                                <td style="text-align:right;" x-text="fmtTok(r.step.prompt_tokens)"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+
+                <!-- recent grounded actions: model 0-1000 → executor px (grounding diagnostic) -->
+                <h4 style="margin-top:18px;">
+                    最近的 grounding 动作
+                    <span x-show="perfSummary && perfSummary.actions" style="font-weight:400; opacity:0.6; font-size:12px;"
+                          x-text="'（共 ' + ((perfSummary && perfSummary.actions) ? perfSummary.actions.total : 0) + ' · ' + Object.entries((perfSummary && perfSummary.actions && perfSummary.actions.by_type) || {}).map(([k,v]) => k+':'+v).join(' ') + '）'"></span>
+                </h4>
+                <div x-show="perfActions.length" style="font-size:12px;">
+                    <template x-for="(a, i) in perfActions.slice().reverse()" :key="i">
+                        <div style="padding:4px 0; border-top:1px solid rgba(255,255,255,0.05);">
+                            <span style="opacity:0.5;" x-text="'run ' + ((a.session || a.run_id || '').slice(-12))"></span>
+                            <b x-text="a.action || '—'"></b>
+                            <span x-show="a.model_position" style="color:#3b82f6;">model <span x-text="(a.model_position || []).join(',')"></span></span>
+                            <span x-show="a.executor_position" style="color:#059669;">→ px <span x-text="(a.executor_position || []).join(',')"></span></span>
+                            <span x-show="a.coord_space" style="opacity:0.5;" x-text="a.coord_space"></span>
+                            <div style="opacity:0.7;" x-text="(a.plan_action || a.instruction || '').slice(0,80)"></div>
+                        </div>
+                    </template>
+                </div>
+                <div x-show="!perfActions.length" style="font-size:12px; opacity:0.55; padding:8px 0;">
+                    还没有动作数据。用 GUI tab 跑个任务，这里会显示 qwen 每次落点（model 0-1000 → 屏幕像素）。
+                </div>
+            </div>
+        </div>
+        <!-- GUI Tab — launch a task through the v3 (longhorizon) pipeline -->
+        <div class="tab-panel" :class="{ 'active': activeTab === 'gui' }">
+            <div style="padding:14px; max-width:920px;">
+                <h3 style="margin:2px 0 6px;">GUI 任务（v3 流水线）</h3>
+                <p style="font-size:12px; opacity:0.7; margin:0 0 12px;">
+                    经 longhorizon pipeline 跑：主循环把 GUI 任务 fold 给一个隔离上下文的 subagent，subagent 通过 <b>gui_action</b> 逐步完成桌面操作，最后把结果写回 blackboard。
+                    <b>不影响普通聊天</b>。完整曲线在 Runs tab，结果在下方 Blackboard 面板。
+                </p>
+                <textarea x-model="guiTaskText" rows="3" placeholder="例：打开 Chrome，搜索 GLM-5.2，把第一个结果的标题记到文件里"
+                          style="width:100%; box-sizing:border-box; background:rgba(255,255,255,0.04); border:1px solid var(--border,#333); color:inherit; border-radius:6px; padding:8px; font-family:inherit;"></textarea>
+                <div style="margin-top:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <button @click="startGuiRun()" :disabled="guiRunning || !guiTaskText.trim()"
+                            style="padding:6px 14px;">用流水线跑</button>
+                    <button @click="cancelGuiRun()" x-show="guiRunning"
+                            style="padding:6px 14px;">取消</button>
+                    <span x-show="guiRunning" style="font-size:12px; opacity:0.7;">运行中…</span>
+                    <span x-show="guiDone && !guiCancelled && !guiError" style="color:#059669; font-size:12px;">✓ 完成</span>
+                    <span x-show="guiCancelled" style="color:#f59e0b; font-size:12px;">⊘ 已取消</span>
+                    <span x-show="guiError" style="color:#ef4444; font-size:12px;" x-text="guiError"></span>
+                    <button x-show="guiAuditDir" @click="viewGuiInRuns()" style="margin-left:auto; font-size:12px;">在 Runs 查看完整图表 →</button>
+                </div>
+
+                <div x-show="guiBlackboard && (guiBlackboard.progress || guiBlackboard.result)" style="margin-top:18px;">
+                    <h4 style="margin:2px 0 6px;">Blackboard</h4>
+                    <div x-show="guiBlackboard.progress" style="font-size:12px; opacity:0.7; margin-bottom:8px;">
+                        progress: <span x-text="guiBlackboard.progress"></span>
+                    </div>
+                    <template x-if="guiBlackboard.result">
+                        <div style="font-size:12px; line-height:1.7;">
+                            <div>status: <b x-text="guiBlackboard.result.status"></b></div>
+                            <div x-show="guiBlackboard.result.summary">summary: <span x-text="guiBlackboard.result.summary"></span></div>
+                            <div x-show="guiBlackboard.result.diagnosis" style="color:#ef4444;">diagnosis: <span x-text="guiBlackboard.result.diagnosis"></span></div>
+                            <div x-show="guiBlackboard.result.iterations_used != null" style="opacity:0.7;">iterations: <span x-text="guiBlackboard.result.iterations_used"></span></div>
+                            <div x-show="guiBlackboard.result.artifacts && guiBlackboard.result.artifacts.length">
+                                artifacts:
+                                <template x-for="art in guiBlackboard.result.artifacts" :key="art">
+                                    <code x-text="art" style="margin-right:6px;"></code>
+                                </template>
+                            </div>
+                            <div x-show="guiBlackboard.result.lessons && guiBlackboard.result.lessons.length">
+                                lessons:
+                                <ul style="margin:4px 0;">
+                                    <template x-for="lesson in guiBlackboard.result.lessons" :key="lesson">
+                                        <li x-text="lesson"></li>
+                                    </template>
+                                </ul>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
         </main>
 
         <!-- Status Bar -->

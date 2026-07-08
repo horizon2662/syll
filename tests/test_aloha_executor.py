@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from syll.agent.aloha.act.executor import AlohaExecutor
+from syll.sandbox.environment import LocalEnvironment
 
 
 @pytest.fixture
@@ -17,7 +18,10 @@ def anyio_backend():
 @pytest.mark.anyio
 async def test_click_uses_extra_consecutive_clicks_by_default():
     """Plain CLICK actions should execute one extra consecutive click by default."""
-    executor = AlohaExecutor(SimpleNamespace(click_backend="pyautogui", mac_click_style="click"))
+    executor = AlohaExecutor(
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="click"),
+        environment=LocalEnvironment(os_type="linux"),
+    )
     pyautogui = MagicMock()
 
     with patch.dict(sys.modules, {"pyautogui": pyautogui}), patch(
@@ -36,7 +40,8 @@ async def test_click_uses_extra_consecutive_clicks_by_default():
 async def test_click_uses_mouse_down_up_on_macos_pyautogui_backend():
     """macOS pyautogui fallback should emit explicit mouseDown/mouseUp events."""
     executor = AlohaExecutor(
-        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True)
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True),
+        environment=LocalEnvironment(os_type="darwin"),
     )
     pyautogui = MagicMock()
 
@@ -61,7 +66,8 @@ async def test_click_uses_mouse_down_up_on_macos_pyautogui_backend():
 async def test_double_click_stays_strict_double_click_on_macos():
     """Explicit DOUBLE_CLICK should stay a strict double-click sequence on macOS."""
     executor = AlohaExecutor(
-        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True)
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True),
+        environment=LocalEnvironment(os_type="darwin"),
     )
     pyautogui = MagicMock()
 
@@ -99,7 +105,8 @@ async def test_triple_click_uses_explicit_click_sequence():
 async def test_desktop_app_icon_uses_command_o_shortcut_on_macos():
     """Desktop .app icons on macOS should use single-click selection + Cmd+O."""
     executor = AlohaExecutor(
-        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True)
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True),
+        environment=LocalEnvironment(os_type="darwin"),
     )
     pyautogui = MagicMock()
 
@@ -129,7 +136,8 @@ async def test_desktop_app_icon_uses_command_o_shortcut_on_macos():
 async def test_click_blocks_when_accessibility_is_denied():
     """Preflight should block mac clicks when Accessibility is explicitly denied."""
     executor = AlohaExecutor(
-        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True)
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True),
+        environment=LocalEnvironment(os_type="darwin"),
     )
     pyautogui = MagicMock()
 
@@ -149,7 +157,8 @@ async def test_click_blocks_when_accessibility_is_denied():
 async def test_key_action_normalizes_cmd_alias_on_macos():
     """cmd+h should normalize to command+h instead of typing only h on macOS."""
     executor = AlohaExecutor(
-        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True)
+        SimpleNamespace(click_backend="pyautogui", mac_click_style="auto", preflight_permissions=True),
+        environment=LocalEnvironment(os_type="darwin"),
     )
     pyautogui = MagicMock()
 

@@ -3,8 +3,8 @@
 Reference: VeriGUI (Baidu, 2026) — TVAE (Think-Verify-Action-Expectation) framework.
 
 This is a standalone module — it does **not** modify ``executor.py``.
-It is used by :class:`VerifiedPlanner` and :class:`GUIExecuteSubAgent` to
-close the verification loop after every action.
+It is used by :class:`VerifiedPlanner` to close the verification loop
+after every action.
 """
 
 from __future__ import annotations
@@ -37,6 +37,10 @@ class VerifyResult:
     confidence: float  # 0.0 – 1.0
     pixel_diff_score: float  # raw diff ratio [0, 1]
     diagnosis: str = ""
+    # Failure category (set by diagnose_no_change; "" for pixel-diff/verify).
+    # A FIELD rather than text packed into ``diagnosis``, so callers read it
+    # structurally instead of parsing "[CATEGORY] reason" strings.
+    category: str = ""
 
     @property
     def is_success(self) -> bool:
@@ -45,6 +49,21 @@ class VerifyResult:
     @property
     def is_no_change(self) -> bool:
         return self.status == VerifyStatus.NO_CHANGE
+
+
+# Taxonomy of WHY a NO_CHANGE happened (SAFARI atomic-hypothesis verification +
+# GUI-vs-CLI failure taxonomy). diagnose_no_change returns "[CATEGORY] reason"
+# so the planner gets an actionable cause instead of the vague pixel-diff
+# "likely had no effect" — different categories need different retry strategies.
+NO_CHANGE_FAILURE_CATEGORIES = (
+    "COORD_OFF",           # coordinate missed the target (grounding error)
+    "ELEMENT_ABSENT",      # target not on screen (loading / scroll / tab)
+    "OCCLUDED",            # target covered by popup/dialog/tooltip
+    "LOADING",             # UI mid-transition (wait and retry)
+    "NO_VISUAL_FEEDBACK",  # action likely worked, no visible change (verify otherwise)
+    "WORKFLOW_ORDER",      # wrong step in the workflow (earlier/later action needed)
+    "UNKNOWN",
+)
 
 
 class ActionVerifier:
@@ -68,8 +87,43 @@ class ActionVerifier:
             # re-plan …
     """
 
-    def __init__(self, pixel_diff_threshold: float = 0.005):
+    def __init__(self, pixel_diff_threshold: float = 0.005, provider=None, on_usage=None):
         self.pixel_diff_threshold = pixel_diff_threshold
+        self.provider = provider
+        self._on_usage = on_usage
+
+    async def _call_vision_llm(
+        self, messages: list[dict], *, model: str, max_tokens: int,
+        temperature: float = 0,
+    ) -> str | None:
+        """One vision LLM call via the attached provider. Returns the text
+        response, or None on error (caller picks the fallback VerifyResult).
+
+        Consolidates the provider.chat + on_usage + finish_reason-check pattern
+        previously duplicated between verify_with_expectation and
+        diagnose_no_change. Provider-only (no litellm fallback) — consistent
+        with the broader #5 收敛; a verifier always has a provider at 0b
+        wire-up, so the litellm branch was dead code.
+        """
+        if self.provider is None:
+            logger.warning("ActionVerifier has no provider; vision call skipped")
+            return None
+        try:
+            resp = await self.provider.chat(
+                messages=messages, model=model,
+                max_tokens=max_tokens, temperature=temperature,
+            )
+            if self._on_usage is not None:
+                try:
+                    self._on_usage(resp)
+                except Exception:
+                    pass
+            if resp.finish_reason == "error" or not resp.content:
+                return None
+            return (resp.content or "").strip()
+        except Exception as exc:
+            logger.warning(f"vision LLM call failed: {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # Pixel-diff verification
@@ -106,15 +160,37 @@ class ActionVerifier:
 
         diff_score = self._compute_pixel_diff(img_before, img_after)
 
-        if diff_score < self.pixel_diff_threshold:
+        # 3-way verdict. A correct focus / select / checkbox-toggle / value-
+        # entered action can produce a TINY pixel change that the old binary
+        # "< threshold = NO_CHANGE" misjudged as failure (triggering a retry
+        # loop on a step that actually worked). Split into:
+        #   - truly-zero (< floor)        → NO_CHANGE  (real failure)
+        #   - small-but-nonzero (< thr)   → UNCERTAIN  (defer to outer agent's
+        #                                              vision — it can see the
+        #                                              focus/selection)
+        #   - clear change (>= threshold) → SUCCESS
+        floor = self.pixel_diff_threshold * 0.1
+        if diff_score < floor:
             return VerifyResult(
                 status=VerifyStatus.NO_CHANGE,
                 confidence=1.0 - diff_score,
                 pixel_diff_score=diff_score,
                 diagnosis=(
-                    f"Screen unchanged after action "
-                    f"(pixel diff {diff_score:.4f} < threshold {self.pixel_diff_threshold}). "
+                    f"Screen essentially unchanged after action "
+                    f"(pixel diff {diff_score:.4f} < floor {floor:.4f}). "
                     "The action likely had no effect."
+                ),
+            )
+        if diff_score < self.pixel_diff_threshold:
+            return VerifyResult(
+                status=VerifyStatus.UNCERTAIN,
+                confidence=0.5,
+                pixel_diff_score=diff_score,
+                diagnosis=(
+                    f"Small screen change (pixel diff {diff_score:.4f}, below "
+                    f"threshold {self.pixel_diff_threshold:.4f} but above noise "
+                    f"floor {floor:.4f}). The action may have worked (focus / "
+                    f"select / value entered) — inspect the screenshot to confirm."
                 ),
             )
 
@@ -133,8 +209,6 @@ class ActionVerifier:
         screenshot_after_b64: str,
         expectation: str,
         model: str = "gpt-4o",
-        api_key: str | None = None,
-        api_base: str | None = None,
     ) -> VerifyResult:
         """Ask an LLM whether the current screenshot matches the *expectation*.
 
@@ -160,8 +234,6 @@ class ActionVerifier:
                 diagnosis="Empty expectation — cannot verify.",
             )
 
-        import litellm
-
         prompt = (
             "You are a GUI action verifier.  Compare the screenshot with the "
             "EXPECTED effect described below.  Reply with ONLY one word: "
@@ -185,28 +257,15 @@ class ActionVerifier:
             },
         ]
 
-        kwargs: dict = dict(
-            model=model,
-            messages=messages,
-            max_tokens=10,
-            temperature=0,
-        )
-        if api_key:
-            kwargs["api_key"] = api_key
-        if api_base:
-            kwargs["api_base"] = api_base
-
-        try:
-            response = await litellm.acompletion(**kwargs)
-            text = (response.choices[0].message.content or "").strip().upper()
-        except Exception as exc:
-            logger.warning(f"LLM verification call failed: {exc}")
+        text = await self._call_vision_llm(messages, model=model, max_tokens=512)
+        if text is None:
             return VerifyResult(
                 status=VerifyStatus.UNCERTAIN,
                 confidence=0.0,
                 pixel_diff_score=0.0,
-                diagnosis=f"LLM call error: {exc}",
+                diagnosis="LLM call error",
             )
+        text = text.upper()
 
         if "SUCCESS" in text:
             return VerifyResult(
@@ -227,6 +286,91 @@ class ActionVerifier:
             confidence=0.5,
             pixel_diff_score=0.0,
             diagnosis=f"LLM response was ambiguous: {text}",
+        )
+
+    async def diagnose_no_change(
+        self,
+        before_b64: str,
+        after_b64: str,
+        action_desc: str = "",
+        expectation: str = "",
+        *,
+        model: str = "gpt-4o",
+        wrong_change: bool = False,
+    ) -> VerifyResult:
+        """Diagnose WHY a verification failed — replaces the vague pixel-diff
+        "likely had no effect" with an actionable category.
+
+        Returns a NO_CHANGE VerifyResult whose ``diagnosis`` is the reason and
+        ``category`` is the failure type. Different categories imply different
+        retry strategies: COORD_OFF → re-ground via spatial context;
+        ELEMENT_ABSENT → scroll/wait; OCCLUDED → dismiss popup;
+        WORKFLOW_ORDER → the error is upstream, not in this action.
+
+        ``wrong_change=False`` (default): pixel-diff said NO_CHANGE — the screen
+        barely changed. Prompt says "screen changed almost nothing".
+        ``wrong_change=True``: pixel-diff said SUCCESS but LLM verify said the
+        screen changed INTO the wrong state. Prompt says "screen DID change but
+        not into the expected state". The same 7 categories apply — a wrong
+        click (COORD_OFF) produces a wrong-but-visible change, etc.
+        """
+        if wrong_change:
+            situation = (
+                "A GUI action ran and the screen DID change, but it did NOT "
+                "change into the expected state — the action's intended effect "
+                "was not achieved. "
+            )
+        else:
+            situation = (
+                "A GUI action ran but the screen changed almost nothing (pixel "
+                "diff below threshold). "
+            )
+        prompt = (
+            f"{situation}Compare the BEFORE and AFTER screenshots plus the "
+            "action taken, then diagnose the MOST LIKELY reason. Reply with "
+            "EXACTLY one line in this format:\n"
+            "CATEGORY | one-sentence reason\n"
+            "CATEGORY must be one of:\n"
+            "- COORD_OFF: the coordinate missed the target element (it is elsewhere)\n"
+            "- ELEMENT_ABSENT: the target is not on screen now (not loaded / needs scroll / different tab)\n"
+            "- OCCLUDED: the target is covered by a popup/tooltip/dialog (dismiss first)\n"
+            "- LOADING: the UI is mid-transition/loading (wait and retry)\n"
+            "- NO_VISUAL_FEEDBACK: the action likely took effect but with no visible change\n"
+            "- WORKFLOW_ORDER: wrong step in the workflow (an earlier/later action is needed first)\n"
+            "- UNKNOWN: cannot determine\n\n"
+            f"Action taken: {action_desc or '(unknown)'}\n"
+            f"Expected effect: {expectation or '(none)'}"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": "BEFORE screenshot:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{before_b64}"}},
+                    {"type": "text", "text": "AFTER screenshot:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{after_b64}"}},
+                ],
+            }
+        ]
+        text = await self._call_vision_llm(messages, model=model, max_tokens=512)
+        if text is None:
+            return VerifyResult(
+                VerifyStatus.NO_CHANGE, 0.0, 0.0,
+                diagnosis="diagnose call error", category="UNKNOWN",
+            )
+        category, reason = "UNKNOWN", text[:200]
+        if "|" in text:
+            cat_part, _, rest = text.partition("|")
+            cat = cat_part.strip().upper().replace(" ", "_").replace("-", "_")
+            if cat in NO_CHANGE_FAILURE_CATEGORIES:
+                category = cat
+                reason = rest.strip()[:200]
+        # category is a FIELD (not packed into diagnosis) — callers read it
+        # structurally instead of parsing "[CATEGORY] reason".
+        return VerifyResult(
+            VerifyStatus.NO_CHANGE, 0.0, 0.0,
+            diagnosis=reason, category=category,
         )
 
     # ------------------------------------------------------------------

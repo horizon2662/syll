@@ -29,6 +29,7 @@ class StepRecord:
     expectation: str
     verify_status: str  # SUCCESS / NO_CHANGE / UNCERTAIN
     diagnosis: str = ""
+    category: str = ""  # failure category (COORD_OFF/...) — for typed SKILL.md lessons
     timestamp: str = ""
 
 
@@ -51,11 +52,13 @@ class StructuredMemory(MemoryStore):
         # → inject into planner prompt instead of raw action_history
     """
 
-    def __init__(self, workspace: Path):
-        super().__init__(workspace)
+    def __init__(self, workspace: Path, provider: Any = None, on_usage: Any = None):
+        super().__init__(workspace, scope="gui_execution")
         self._history_file = self.memory_dir / "execution_history.md"
         self._compressed_file = self.memory_dir / "execution_summary.md"
         self._steps: list[StepRecord] = []
+        self.provider = provider
+        self._on_usage = on_usage
 
     # ------------------------------------------------------------------
     # Recording
@@ -68,6 +71,7 @@ class StructuredMemory(MemoryStore):
         expectation: str,
         verify_status: str,
         diagnosis: str = "",
+        category: str = "",
     ) -> None:
         """Append a step record to the in-memory list and persist it."""
         record = StepRecord(
@@ -76,6 +80,7 @@ class StructuredMemory(MemoryStore):
             expectation=expectation,
             verify_status=verify_status,
             diagnosis=diagnosis,
+            category=category,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         self._steps.append(record)
@@ -164,15 +169,31 @@ class StructuredMemory(MemoryStore):
         )
 
         try:
-            import litellm
+            if self.provider is not None:
+                resp = await self.provider.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=model,
+                    max_tokens=500,
+                    temperature=0,
+                )
+                if self._on_usage is not None:
+                    try:
+                        self._on_usage(resp)
+                    except Exception:
+                        pass
+                if resp.finish_reason == "error" or not resp.content:
+                    raise RuntimeError(resp.content or "LLM provider error")
+                summary = resp.content
+            else:
+                import litellm
 
-            response = await litellm.acompletion(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0,
-            )
-            summary = response.choices[0].message.content or ""
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=500,
+                    temperature=0,
+                )
+                summary = response.choices[0].message.content or ""
         except Exception as exc:
             logger.warning(f"Failed to compress history via LLM: {exc}")
             summary = self._rule_based_compression()

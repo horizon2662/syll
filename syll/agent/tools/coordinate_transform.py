@@ -22,6 +22,7 @@ class ActorType(str, Enum):
 
     UI_TARS = "ui_tars"  # model output = screenshot pixel coords (identity)
     SHOWUI = "showui"  # model output = XGA/WXGA/FWXGA scaled coords
+    NORMALIZED = "normalized"  # model output = 0-1000 normalized coords (e.g. qwen3-vl)
 
 
 @dataclass
@@ -174,6 +175,13 @@ class CoordinateTransformService:
                 # Model saw a scaled image; reverse-scale to logical size
                 return self._reverse_scale(x, y, ctx, actor)
             return x, y  # identity when screenshot was not scaled
+        elif actor.actor_type == ActorType.NORMALIZED:
+            # Model emits 0-1000 normalized coords regardless of the image
+            # size it was shown (e.g. qwen3-vl / UI-TARS-trained VLMs that
+            # ignore pixel-bound hints). Map 0-1000 → screenshot pixel space.
+            sw = ctx.screenshot_width or 1
+            sh = ctx.screenshot_height or 1
+            return round(x / 1000 * sw), round(y / 1000 * sh)
         elif actor.actor_type == ActorType.SHOWUI:
             return self._showui_model_to_screenshot(x, y, ctx)
         return x, y

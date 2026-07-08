@@ -85,6 +85,15 @@ class SubagentResult:
     diagnosis: str = ""  # failure reason -> main agent replans
     lessons: list[str] = field(default_factory=list)  # candidate SKILL.md entries
     iterations_used: int = 0
+    # Token cost of this subagent run, bubbled up so the runner can finally
+    # fill DecisionUnit.executor_tokens_in/out + active_context_tokens.
+    # Accumulated across the subagent's internal LLM calls (up to
+    # max_iterations). `last_prompt_tokens` is the FINAL internal call's input
+    # size — since context only grows inside a subagent, it ~= the peak working
+    # context the subagent reached (the overflow indicator).
+    tokens_in: int = 0           # cumulative prompt_tokens
+    tokens_out: int = 0          # cumulative completion_tokens
+    last_prompt_tokens: int = 0  # final internal call's prompt_tokens (~ peak)
 
     @property
     def ok(self) -> bool:

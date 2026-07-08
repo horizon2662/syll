@@ -6,7 +6,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from syll.agent.memory import MemoryStore
+from syll.agent.memory import GlobalMemoryStore, MemoryStore
 from syll.agent.skills import SkillsLoader
 from syll.agent.tools.base import ToolResult
 from syll.config.schema import IdentityConfig
@@ -23,9 +23,19 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
 
-    def __init__(self, workspace: Path, identity: IdentityConfig | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        global_memory: MemoryStore | None = None,
+        identity: IdentityConfig | None = None,
+    ):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        # ``self.memory`` is the user-scoped global memory store. All automatic
+        # daily notes (``append_today``) go here so they survive workspace swaps.
+        self.memory = global_memory or GlobalMemoryStore()
+        # ``self.workspace_memory`` holds project/workspace-specific notes that
+        # should not pollute the global user memory.
+        self.workspace_memory = MemoryStore(workspace, scope="workspace")
         self.skills = SkillsLoader(workspace)
         self.identity = identity or IdentityConfig()
         # Lazily-built, reused across turns (avoids re-instantiating the skill
@@ -88,10 +98,16 @@ class ContextBuilder:
             except OSError:
                 pass  # graceful degradation if read fails
 
-        # Memory context
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        # Memory context — global user memory + workspace-local overlay.
+        memory_parts: list[str] = []
+        global_memory = self.memory.get_memory_context()
+        if global_memory:
+            memory_parts.append(f"## Global Memory\n{global_memory}")
+        workspace_memory = self.workspace_memory.get_memory_context()
+        if workspace_memory:
+            memory_parts.append(f"## Workspace Memory\n{workspace_memory}")
+        if memory_parts:
+            parts.append("# Memory\n\n" + "\n\n".join(memory_parts))
 
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
@@ -246,8 +262,61 @@ When a skill (SKILL.md) is relevant to the current task:
 
         return "\n\n".join(parts) if parts else ""
 
+    def _gui_behavior_guidance_lines(self) -> list[str]:
+        """Always-on guidance for the single-step gui_action tool."""
+        return [
+            "# GUI action — one verified step per call",
+            "",
+            "`gui_action` does EXACTLY ONE step per call: screenshot → plan → "
+            "execute → verify (did the screen change?), then returns the result "
+            "+ before/after screenshots. It does NOT retry internally and holds "
+            "NO state between calls — every call is independent. YOU drive all "
+            "iteration and reflection.",
+            "",
+            "YOU are the ORCHESTRATOR (the global planner) of the multi-step GUI "
+            "task: keep the overall goal in mind, track what each step achieved, "
+            "and call gui_action ONCE per step with a SPECIFIC instruction for "
+            "that step. gui_action itself has NO memory of previous steps — so "
+            "your instruction must carry the context (e.g. 'the File menu is "
+            "already open, now click Save'). After each SUCCESS, immediately do "
+            "the next step; do NOT stop until you get [DONE] or the task is "
+            "genuinely complete. If you get stuck (2-3 NO_CHANGE on the same "
+            "sub-goal), report progress + the blocker to the user.",
+            "",
+            "Read the first line of each result:",
+            "- `[STEP] gui_action: SUCCESS` — action worked. Call gui_action "
+            "again for the next sub-goal, or report completion. Do NOT pass "
+            "prior_failures.",
+            "- `[STEP] gui_action: UNCERTAIN` — small/ambiguous change (often a "
+            "real focus/select/value-entered). LOOK at the attached screenshot: "
+            "if it worked, continue (no prior_failures); if not, retry as NO_CHANGE.",
+            "- `[STEP] gui_action: NO_CHANGE` — the action had no real effect. "
+            "The result includes an Error type (GROUNDING or PLAN) + Category + "
+            "a targeted Next hint. Retry the SAME sub-goal once or twice "
+            "following that hint.",
+            "- `[STEP] gui_action: ERROR` — executor failed. Check the target, retry.",
+            "- `[DONE] gui_action: DONE` — task complete. Stop and report success.",
+            "",
+            "`prior_failures` lifecycle (IMPORTANT — the tool is stateless):",
+            "- Pass `prior_failures=[{category, reason}]` ONLY when immediately "
+            "re-attempting the SAME step that just returned NO_CHANGE — it tells "
+            "the planner what to avoid this time.",
+            "- Do NOT pass it on a fresh sub-goal, after a SUCCESS, or after "
+            "moving on — stale failure context misleads the planner. Each new "
+            "step starts clean.",
+            "",
+            "Error-type hints: GROUNDING (COORD_OFF/OCCLUDED — right action, "
+            "missed coords → re-call with the same goal; the actor re-locates "
+            "from the fresh screenshot); PLAN (ELEMENT_ABSENT/WORKFLOW_ORDER/"
+            "LOADING — wrong target/order → scroll, navigate, wait, or pick a "
+            "different action). Give up after 2-3 consecutive NO_CHANGE on the "
+            "same sub-goal and report to the user.",
+            "",
+        ]
+
     def _build_gui_skills_section(self) -> str:
-        """Build system prompt section listing available GUI demonstration skills."""
+        """Build the GUI system-prompt section: always-on single-step behavior
+        guidance, plus a list of recorded demonstration skills when any exist."""
         if self._gui_store is None:
             from syll.agent.gui_skill import GUISkillStore
             self._gui_store = GUISkillStore(self.workspace)
@@ -256,47 +325,50 @@ When a skill (SKILL.md) is relevant to the current task:
             self._aloha_store = AlohaSkillStore(self.workspace)
 
         gui_skills = self._gui_store.list_gui_skills()
-
-        lines: list[str] = []
-        if gui_skills:
-            lines = ["# GUI Demonstration Skills", ""]
-            lines.append(
-                "The following GUI skills have recorded demonstrations. "
-                "When executing similar tasks, use "
-                '`gui_action(instruction="...", skill_name="xxx")` '
-                "to inject demonstration context:"
-            )
-            lines.append("")
-            for s in gui_skills:
-                lines.append(f"- **{s['name']}**: {s['description']} ({s['steps']} steps)")
-
-        # Append Aloha skills
         try:
             aloha_skills = self._aloha_store.list_skills()
         except Exception:
             aloha_skills = []
 
+        # Behavior guidance is always present (ad-hoc tasks need it even with
+        # no recorded skills).
+        lines: list[str] = self._gui_behavior_guidance_lines()
+
+        skill_lines: list[str] = []
+        if gui_skills:
+            skill_lines += [
+                "# GUI Demonstration Skills",
+                "",
+                "The following GUI skills have recorded demonstrations. When "
+                "executing similar tasks, use "
+                '`gui_action(instruction="...", skill_name="xxx")` to inject '
+                "demonstration context:",
+                "",
+            ]
+            for s in gui_skills:
+                skill_lines.append(f"- **{s['name']}**: {s['description']} ({s['steps']} steps)")
+
         if aloha_skills:
-            if not lines:
-                lines = ["# GUI Demonstration Skills", ""]
-            lines.append("")
-            lines.append(
+            if not skill_lines:
+                skill_lines += ["# GUI Demonstration Skills", ""]
+            skill_lines += [
+                "",
                 "When the user asks you to perform any of these GUI tasks, "
                 "you MUST use `gui_action_planned` with the matching skill_name. "
-                "Do NOT use shell commands, exec, or other tools for these tasks."
-            )
-            lines.append("")
+                "Do NOT use shell commands, exec, or other tools for these tasks.",
+                "",
+            ]
             for s in aloha_skills:
                 desc = s.get('description') or s['name']
                 aliases = s.get('aliases', [])
                 alias_str = f" (also: {', '.join(aliases)})" if aliases else ""
-                lines.append(
+                skill_lines.append(
                     f"- **{s['name']}**: {desc}{alias_str}\n"
                     f"  → `gui_action_planned(instruction=\"{desc}\", skill_name=\"{s['name']}\")`"
                 )
 
-        if not lines:
-            return ""
+        if skill_lines:
+            lines += [""] + skill_lines
         return "\n".join(lines)
 
     def build_messages(

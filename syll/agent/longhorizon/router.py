@@ -14,7 +14,6 @@ with a cheap LLM fallback for ambiguous cases.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from syll.providers.base import LLMProvider
 
@@ -75,19 +74,77 @@ async def run_gui_via_v3(
     model: str | None = None,
     skill: str = "gui",
 ) -> str:
-    """Run a GUI task end-to-end through the v3 (longhorizon) pipeline.
+    """Run a GUI task end-to-end through the v3 (longhorizon) subagent.
 
     Reuses the caller's already-configured provider (the ghost's), so model/auth
-    stay consistent. Returns a summary string the caller can reply with; the
-    full audit trail lands in PROJECT.md / SKILL.md / agents/ under the workspace.
+    stay consistent. Spawns one isolated subagent that drives ``gui_action`` /
+    ``gui_action_planned`` repeatedly until the task is done, then folds its
+    result back to the caller.
     """
+    from syll.agent.events import EventStore
     from syll.agent.longhorizon.config import RunnerConfig
-    from syll.agent.longhorizon.runner import Runner
+    from syll.agent.longhorizon.context_meter import ContextMeter, resolve_context_window
+    from syll.agent.longhorizon.skill_memory import SkillMemory
+    from syll.agent.longhorizon.unified_subagent import UnifiedSubagentManager
+    from syll.bus.queue import MessageBus
+    from syll.config.loader import load_config
+    from syll.sandbox.environment import LocalEnvironment
 
-    cfg = RunnerConfig.from_env(skill=skill, workspace=workspace)
+    ws = Path(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    cfg = RunnerConfig.from_env(skill=skill, workspace=ws)
     if model:
         cfg.model = model
-    runner = Runner(cfg, provider)
-    await runner.run(task)
-    summary = runner.global_mem.load()
-    return summary or "(v3 pipeline finished; see PROJECT.md in the workspace)"
+
+    try:
+        syll_cfg = load_config()
+    except Exception:
+        syll_cfg = None
+
+    gui_cfg = None
+    if syll_cfg is not None:
+        try:
+            gui_cfg = syll_cfg.tools.gui
+        except Exception:
+            gui_cfg = None
+
+    try:
+        event_store = EventStore(ws.parent)
+    except Exception:
+        event_store = None
+
+    meter = ContextMeter(
+        run_dir=ws / "audit",
+        run_id=ws.name,
+        budget_tokens=resolve_context_window(cfg.model, cfg.context_window),
+    )
+
+    manager = UnifiedSubagentManager(
+        provider=provider,
+        workspace=ws,
+        bus=MessageBus(),
+        model=cfg.model,
+        max_iterations=cfg.max_subagent_iterations,
+        gui_config=gui_cfg,
+        syll_config=syll_cfg,
+        event_store=event_store,
+        context_meter=meter,
+        skill_memory=SkillMemory(ws, skill),
+        environment=LocalEnvironment(workspace_root=ws),
+    )
+
+    result = await manager.run_sync(
+        task=task,
+        label="longhorizon",
+        skill=skill,
+        objective=task,
+        mode="step",
+    )
+
+    if result.ok:
+        return result.summary or "(v3 subagent completed with no summary)"
+    return (
+        f"(v3 subagent failed: {result.diagnosis or 'unknown failure'})"
+        f"\n\nLast summary: {result.summary or '(none)'}"
+    ).strip()

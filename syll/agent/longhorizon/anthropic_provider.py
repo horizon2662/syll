@@ -186,7 +186,10 @@ class AnthropicMessagesProvider(LLMProvider):
             }
 
         return LLMResponse(
-            content=content_text or None,
+            # Preserve empty string — downstream callers now handle it correctly.
+            # Previously `or None` converted "" → None, masking the fact that
+            # the model returned no text blocks (only thinking / tool_use).
+            content=content_text if content_text is not None else None,
             tool_calls=tool_calls,
             finish_reason=getattr(resp, "stop_reason", "stop") or "stop",
             usage=usage,

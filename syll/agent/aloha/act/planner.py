@@ -8,6 +8,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 from loguru import logger
@@ -22,11 +23,13 @@ class AlohaPlanner:
         self,
         model: str,
         os_name: str = "macOS",
-        max_tokens: int = 8000,
-        retry_attempts: int = 2,
+        max_tokens: int = 1500,
+        retry_attempts: int = 1,
         retry_delay_seconds: float = 1.0,
         api_key: str | None = None,
         api_base: str | None = None,
+        provider: Any = None,
+        on_usage: Any = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -35,6 +38,10 @@ class AlohaPlanner:
         self.retry_delay_seconds = retry_delay_seconds
         self.api_key = api_key
         self.api_base = api_base
+        # 0b: when set, route model calls through a shared LLMProvider so
+        # usage is observable (ContextMeter) instead of a bare litellm call.
+        self.provider = provider
+        self._on_usage = on_usage
 
         self._jinja_env = Environment(
             loader=FileSystemLoader(str(PROMPT_TEMPLATES_DIR)),
@@ -49,6 +56,7 @@ class AlohaPlanner:
         guidance_trajectory: str = "",
         screenshot_b64: str = "",
         action_history: list[str] | None = None,
+        **kwargs: Any,
     ) -> dict:
         """Generate a plan for the next action.
 
@@ -61,8 +69,6 @@ class AlohaPlanner:
         Returns:
             Dict with Observation, Reasoning, Current Step, Action, Expectation.
         """
-        import litellm
-
         system_prompt = self._get_system_prompt(guidance_trajectory)
 
         action_history = action_history or []
@@ -78,7 +84,6 @@ class AlohaPlanner:
             action_history_str=action_history_str,
         )
 
-        # Build messages
         content: list[dict] = [{"type": "text", "text": user_text}]
         if screenshot_b64:
             content.append({
@@ -102,11 +107,8 @@ class AlohaPlanner:
         if self.api_base:
             kwargs["api_base"] = self.api_base
 
-        response = await self._call_model_with_retry(litellm, kwargs)
+        llm_response = await self._call_model_with_retry(kwargs)
 
-        llm_response = response.choices[0].message.content
-
-        # Parse response
         try:
             llm_response_json = self._extract_data(llm_response)
             parsed_dict = json.loads(llm_response_json)
@@ -116,7 +118,6 @@ class AlohaPlanner:
             logger.error(f"Failed to parse planner JSON: {e}")
             parsed_dict = {}
 
-        # Parse current step
         current_step_raw = parsed_dict.get('Current Step in Guidance Trajectory')
         if isinstance(current_step_raw, str) and current_step_raw.strip():
             try:
@@ -130,24 +131,51 @@ class AlohaPlanner:
             parsed_dict.setdefault('Current Step', 1)
             parsed_dict.setdefault('Current Step Explanation', "No step information")
 
-        # Ensure required fields
         for field in ("Action", "Reasoning", "Observation", "Expectation"):
             parsed_dict.setdefault(field, "")
 
         return parsed_dict
 
-    async def _call_model_with_retry(self, litellm: object, kwargs: dict) -> object:
-        """Call the planner model with a small retry budget for flaky provider errors."""
+    async def _call_model_with_retry(self, kwargs: dict) -> str:
+        """Call the planner model and return its text, with a small retry budget.
+
+        Routes through the injected ``provider`` (LLMProvider) when set — so
+        the call is observable (usage → on_usage) — and falls back to a direct
+        ``litellm.acompletion`` for backward compatibility.
+        """
         last_error: Exception | None = None
 
         for attempt in range(1, self.retry_attempts + 2):
             try:
-                request_kwargs = dict(kwargs)
+                messages = kwargs["messages"]
                 if attempt > 1:
-                    request_kwargs["messages"] = self._messages_with_json_reminder(
-                        request_kwargs["messages"]
+                    messages = self._messages_with_json_reminder(messages)
+
+                if self.provider is not None:
+                    resp = await self.provider.chat(
+                        messages=messages,
+                        model=self.model,
+                        max_tokens=kwargs.get("max_tokens", self.max_tokens),
+                        temperature=kwargs.get("temperature", 0),
                     )
-                return await litellm.acompletion(**request_kwargs)
+                    # provider.chat folds errors into finish_reason="error"
+                    # rather than raising; surface them so the retry loop
+                    # reacts, matching the legacy litellm behaviour.
+                    if resp.finish_reason == "error" or not resp.content:
+                        raise RuntimeError(resp.content or "LLM provider error")
+                    if self._on_usage is not None:
+                        try:
+                            self._on_usage(resp)
+                        except Exception:
+                            pass
+                    return resp.content
+
+                import litellm
+
+                request_kwargs = dict(kwargs)
+                request_kwargs["messages"] = messages
+                response = await litellm.acompletion(**request_kwargs)
+                return response.choices[0].message.content
             except Exception as exc:  # pragma: no cover - provider-specific subclasses
                 last_error = exc
                 if attempt > self.retry_attempts:

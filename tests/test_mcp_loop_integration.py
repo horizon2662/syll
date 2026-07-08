@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from syll.agent.mcp import MCPManager
+from syll.agent.memory import MemoryStore
 from syll.agent.tools.base import Tool
 from syll.config.schema import (
     MCPConfig,
@@ -56,7 +57,10 @@ def _make_agent_loop(mcp_manager=None):
     with patch("syll.agent.loop.ContextBuilder") as ctx_cls, \
          patch("syll.agent.loop.SessionManager") as sess_cls, \
          patch("syll.agent.loop.EventStore") as evt_cls:
-        ctx_cls.return_value = SimpleNamespace(identity=None)
+        ctx_cls.return_value = SimpleNamespace(
+            identity=None,
+            memory=MemoryStore(Path("/tmp"), scope="workspace"),
+        )
         sess_cls.return_value = SimpleNamespace()
         evt_cls.return_value = SimpleNamespace()
         loop = AgentLoop(
@@ -248,7 +252,7 @@ async def test_subagent_run_registers_propagating_tools(repo_root, monkeypatch):
 
         registered_names: list[str] = []
 
-        async def _fake_chat(self, messages, tools, model):
+        async def _fake_chat(self, messages, tools, model, max_tokens=None):
             # Snapshot what the subagent passed to the provider.
             registered_names.extend(
                 d["function"]["name"] for d in tools or []

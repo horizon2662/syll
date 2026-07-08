@@ -95,11 +95,13 @@ def write_gui_state(
     action: str = "",
     thought: str = "",
     error: str = "",
+    timing: dict | None = None,
 ) -> None:
     """Write current GUI execution state to the monitor state file.
 
     Thread-safe — safe to call from any thread (including asyncio).
-    No Qt import needed.
+    No Qt import needed. ``timing`` is an optional dict of phase→ms
+    (e.g. ``{"capture": 400, "planner": 30000, ...}``) shown in the overlay.
     """
     blob = {
         "status":      status,
@@ -109,6 +111,7 @@ def write_gui_state(
         "action":      action,
         "thought":     thought,
         "error":       error,
+        "timing":      timing or {},
         "ts":          datetime.now().isoformat(),
     }
     try:

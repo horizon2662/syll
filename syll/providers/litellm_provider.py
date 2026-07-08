@@ -79,7 +79,8 @@ class LiteLLMProvider(LLMProvider):
             (api_base and "openrouter" in api_base)
         )
 
-        # Detect Anthropic-compatible endpoint (e.g. Zhipu /api/anthropic)
+        # Detect Anthropic-compatible endpoint (Zhipu /api/anthropic).
+        # Kimi /coding/v1 is OpenAI-compatible (no prefix, pass-through).
         self.is_anthropic_endpoint = (
             bool(api_base) and "/anthropic" in api_base
         )
@@ -197,8 +198,8 @@ class LiteLLMProvider(LLMProvider):
         """
         model = self._prepare_model(model)
 
-        # kimi-k2.5 only supports temperature=1.0
-        if "kimi-k2.5" in model.lower():
+        # Kimi models (kimi-k2.5, kimi-for-coding, ...) only support temperature=1
+        if "kimi" in model.lower():
             temperature = 1.0
 
         kwargs: dict[str, Any] = {
@@ -290,7 +291,7 @@ class LiteLLMProvider(LLMProvider):
         import json as _json
 
         model = self._prepare_model(model)
-        if "kimi-k2.5" in model.lower():
+        if "kimi" in model.lower():  # Kimi models only support temperature=1
             temperature = 1.0
 
         kwargs: dict[str, Any] = {
@@ -299,6 +300,10 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": True,
+            # Ask for a usage-bearing final chunk so the ContextMeter gets real
+            # prompt_tokens for the streaming path too. Providers that ignore it
+            # just yield no usage (meter records 0 for that call).
+            "stream_options": {"include_usage": True},
         }
         if self.api_key:
             kwargs["api_key"] = self.api_key
@@ -316,7 +321,23 @@ class LiteLLMProvider(LLMProvider):
             accumulated_reasoning_content = ""
             tool_calls_acc: dict[int, dict] = {}
 
+            usage_dict: dict[str, int] = {}
             async for chunk in response:
+                # Capture usage from the usage-bearing final chunk
+                # (stream_options.include_usage). Provider-agnostic.
+                _u = getattr(chunk, "usage", None)
+                if _u:
+                    try:
+                        usage_dict = {
+                            "prompt_tokens": int(getattr(_u, "prompt_tokens", 0) or 0),
+                            "completion_tokens": int(getattr(_u, "completion_tokens", 0) or 0),
+                            "total_tokens": int(getattr(_u, "total_tokens", 0) or 0),
+                        }
+                    except Exception:
+                        pass
+                # The usage-only final chunk has empty choices — skip delta logic.
+                if not getattr(chunk, "choices", None):
+                    continue
                 delta = chunk.choices[0].delta
                 finish = chunk.choices[0].finish_reason
 
@@ -364,7 +385,7 @@ class LiteLLMProvider(LLMProvider):
                     event["reasoning_content"] = accumulated_reasoning_content
                 yield event
 
-            yield {"type": "done"}
+            yield {"type": "done", "usage": usage_dict}
 
         except Exception as e:
             yield {"type": "token", "content": f"Error calling LLM: {e}"}

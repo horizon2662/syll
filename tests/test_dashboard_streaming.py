@@ -724,7 +724,7 @@ def test_process_streaming_can_run_as_cli_channel(monkeypatch):
             return []
 
     class _Provider:
-        async def chat_stream(self, messages, tools, model):
+        async def chat_stream(self, messages, tools, model, max_tokens=None):
             yield {"type": "token", "content": "ok"}
             yield {"type": "done"}
 
@@ -745,6 +745,7 @@ def test_process_streaming_can_run_as_cli_channel(monkeypatch):
         model="stub",
         max_iterations=1,
         event_store=_EventStore(),
+        get_context_meter=lambda _session_key: None,
     )
 
     events = asyncio.run(
@@ -803,7 +804,7 @@ def test_process_streaming_reports_followup_thinking_after_tool_result(monkeypat
         def __init__(self):
             self.calls = 0
 
-        async def chat_stream(self, messages, tools, model):
+        async def chat_stream(self, messages, tools, model, max_tokens=None):
             self.calls += 1
             if self.calls == 1:
                 yield {
@@ -841,6 +842,7 @@ def test_process_streaming_reports_followup_thinking_after_tool_result(monkeypat
         model="stub",
         max_iterations=2,
         event_store=_EventStore(),
+        get_context_meter=lambda _session_key: None,
     )
 
     events = asyncio.run(

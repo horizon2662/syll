@@ -41,13 +41,12 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from syll.agent.tools.base import Tool
-from syll.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
+from syll.agent.tools.bundles import register_core_tools
 from syll.agent.tools.registry import ToolRegistry
-from syll.agent.tools.shell import ExecTool
-from syll.agent.tools.web import WebFetchTool, WebSearchTool
 from syll.bus.events import InboundMessage
 from syll.bus.queue import MessageBus
 from syll.providers.base import LLMProvider
+from syll.sandbox.environment import Environment, LocalEnvironment
 
 from .blackboard import Blackboard
 from .contract import SubagentContract, SubagentResult
@@ -155,9 +154,13 @@ class UnifiedSubagentManager:
         gui_config: Any = None,
         syll_config: Any = None,
         event_store: Any = None,
+        context_meter: Any = None,
+        skill_memory: Any = None,
+        environment: Environment | None = None,
     ):
         from syll.config.schema import ExecToolConfig
 
+        self.environment = environment or LocalEnvironment(workspace_root=workspace)
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -172,6 +175,13 @@ class UnifiedSubagentManager:
         self.gui_config = gui_config
         self.syll_config = syll_config
         self.event_store = event_store
+        # 0b: ContextMeter threaded from the Runner so GUI model calls
+        # (planner/actor/spatial/verify) record usage into this run's
+        # context_curve.jsonl instead of staying invisible.
+        self.context_meter = context_meter
+        # L2: SkillMemory threaded from the Runner so failed GUI-step
+        # diagnoses can be lifted into SKILL.md (lesson upflow).
+        self.skill_memory = skill_memory
         self._running: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
@@ -242,6 +252,9 @@ class UnifiedSubagentManager:
             diagnosis=d.get("diagnosis", ""),
             lessons=d.get("lessons", []),
             iterations_used=d.get("iterations_used", 0),
+            tokens_in=d.get("tokens_in", 0),
+            tokens_out=d.get("tokens_out", 0),
+            last_prompt_tokens=d.get("last_prompt_tokens", 0),
         )
 
     # ------------------------------------------------------------------
@@ -312,67 +325,58 @@ class UnifiedSubagentManager:
         ]
 
         last_response = ""
-        completed_normally = False
-        iteration = 0
-        while iteration < self.max_iterations:
-            if done.done():  # branch already returned via ReturnTool
-                break
-            iteration += 1
-            bb.write_progress(f"iteration {iteration}")
+        # Token accumulators for the runner's DecisionUnit (bubbled via the
+        # fold). last_prompt_tokens ~= peak working context this subagent
+        # reached, since context only grows inside the loop.
+        tokens_in = tokens_out = 0
+        last_prompt_tokens = 0
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=tools.get_definitions(),
-                model=self.model,
-            )
-            last_response = response.content or ""
+        def on_usage(resp, it):
+            nonlocal tokens_in, tokens_out, last_prompt_tokens
+            usage = resp.usage or {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            tokens_in += prompt_tokens
+            tokens_out += int(usage.get("completion_tokens", 0) or 0)
+            last_prompt_tokens = prompt_tokens
 
-            if not response.has_tool_calls:
-                # Model gave a final text answer without calling return.
-                # This is a NORMAL completion -> fold it as a success summary.
-                completed_normally = True
-                break
+        # Shared tool-calling primitive (L1). pre_iteration mirrors the old
+        # `if done.done(): break` (ReturnTool completion); on_iteration_start
+        # writes blackboard progress; on_usage accumulates the tokens bubbled
+        # out via the fold. Message formatting is now unified (incl.
+        # ToolResult.media + reasoning_content — previously dropped here).
+        from syll.agent.loop_core import run_tool_loop
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ],
-                }
-            )
-            for tc in response.tool_calls:
-                out = await tools.execute(tc.name, tc.arguments)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": tc.name,
-                        "content": out,
-                    }
-                )
+        loop_result = await run_tool_loop(
+            self.provider,
+            tools,
+            messages,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            on_usage=on_usage,
+            pre_iteration=lambda it: done.done(),
+            on_iteration_start=lambda it: bb.write_progress(f"iteration {it}"),
+        )
+        completed_normally = loop_result.stop_reason == "no_tool_calls"
+        last_response = (
+            (loop_result.final_response.content or "") if loop_result.final_response else ""
+        )
+        iteration = loop_result.iterations
 
         if done.done():
-            r = done.result()
-            r.iterations_used = iteration
-            return r
+            # Stamp the accumulated tokens onto the result ReturnTool built.
+            return self._stamp_accounting(
+                done.result(), iteration, tokens_in, tokens_out, last_prompt_tokens
+            )
 
         if completed_normally:
             # Fold the model's final text answer as the summary (NOT a failure).
-            return SubagentResult(
-                run_id=run_id,
-                status="ok",
-                summary=last_response[:2000] or "(completed with no text)",
-                iterations_used=iteration,
+            return self._stamp_accounting(
+                SubagentResult(
+                    run_id=run_id,
+                    status="ok",
+                    summary=last_response[:2000] or "(completed with no text)",
+                ),
+                iteration, tokens_in, tokens_out, last_prompt_tokens,
             )
 
         # Truly exhausted the budget (kept calling tools, never finished).
@@ -380,34 +384,81 @@ class UnifiedSubagentManager:
             f"subagent[{run_id}] hit iteration budget ({self.max_iterations}) "
             "without finishing; folding last response as failure."
         )
-        return SubagentResult(
-            run_id=run_id,
-            status="failed",
-            summary=last_response[:2000] or "(no output)",
-            diagnosis=(
-                f"Hit iteration budget ({self.max_iterations}) without finishing."
+        return self._stamp_accounting(
+            SubagentResult(
+                run_id=run_id,
+                status="failed",
+                summary=last_response[:2000] or "(no output)",
+                diagnosis=(
+                    f"Hit iteration budget ({self.max_iterations}) without finishing."
+                ),
             ),
-            iterations_used=iteration,
+            iteration, tokens_in, tokens_out, last_prompt_tokens,
         )
+
+    @staticmethod
+    def _stamp_accounting(
+        result: SubagentResult,
+        iteration: int,
+        tokens_in: int,
+        tokens_out: int,
+        last_prompt_tokens: int,
+    ) -> SubagentResult:
+        """Fold the accumulated iteration/token counters onto a SubagentResult.
+
+        The three exit paths (ReturnTool completion / normal text answer /
+        budget exhausted) all stamp the same four counters; this is the single
+        place that mapping lives. Mutates and returns ``result``."""
+        result.iterations_used = iteration
+        result.tokens_in = tokens_in
+        result.tokens_out = tokens_out
+        result.last_prompt_tokens = last_prompt_tokens
+        return result
 
     # ------------------------------------------------------------------
     # tool set + prompt
     # ------------------------------------------------------------------
     def _build_tools(self) -> ToolRegistry:
         tools = ToolRegistry()
-        allowed = self.workspace if self.restrict_to_workspace else None
-        tools.register(ReadFileTool(allowed_dir=allowed))
-        tools.register(WriteFileTool(allowed_dir=allowed))
-        tools.register(ListDirTool(allowed_dir=allowed))
-        tools.register(
-            ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-            )
+        # Resolve the Brave key from syll_config when not passed explicitly
+        # (the long-horizon runner constructs this manager without one, which
+        # left web search keyless).
+        brave = self.brave_api_key
+        if not brave and self.syll_config is not None:
+            try:
+                brave = self.syll_config.tools.web.search.api_key or None
+            except Exception:
+                brave = None
+        register_core_tools(
+            tools,
+            workspace=self.workspace,
+            restrict_to_workspace=self.restrict_to_workspace,
+            exec_config=self.exec_config,
+            brave_api_key=brave,
+            environment=self.environment,
         )
-        tools.register(WebSearchTool(api_key=self.brave_api_key))
-        tools.register(WebFetchTool())
+
+        # Video-learning: the runner can autonomously watch an online tutorial
+        # (search -> download -> analyze frames -> SKILL.md) to acquire an
+        # unfamiliar GUI procedure, then follow it via gui_action_planned. The
+        # frame analyzer reuses the vision (actor) endpoint.
+        try:
+            from syll.agent.tools.video_learn import VideoLearnTool
+
+            if self.syll_config is not None:
+                ep = self.syll_config.resolve_endpoint("actor")
+                vid_model = ep.litellm_model or self.model or ""
+                vid_key, vid_base = ep.api_key, (ep.api_base or "")
+            else:
+                vid_model, vid_key, vid_base = (self.model or ""), "", ""
+            tools.register(
+                VideoLearnTool(
+                    model=vid_model, api_key=vid_key, api_base=vid_base,
+                    workspace=self.workspace, brave_api_key=brave or "",
+                )
+            )
+        except Exception as exc:  # optional dep (yt-dlp) missing -> degrade
+            logger.debug(f"video_learn tool not registered: {exc}")
 
         if self.mcp_manager is not None:
             for adapter in self.mcp_manager.iter_propagating_tools():
@@ -419,38 +470,69 @@ class UnifiedSubagentManager:
         # gui_config.enabled, exactly like AgentLoop._register_default_tools.
         if self.gui_config is not None and getattr(self.gui_config, "enabled", False):
             from syll.agent.aloha_gui_skill import AlohaSkillStore
-            from syll.agent.gui_skill import GUISkillStore
             from syll.agent.tools.screenshot import ScreenshotTool
-            from syll.agent.tools.ui_tars import UITarsTool
 
-            gui_skill_store = GUISkillStore(self.workspace)
             aloha_skill_store = AlohaSkillStore(self.workspace)
-            tools.register(ScreenshotTool())
+            tools.register(ScreenshotTool(environment=self.environment))
 
-            ui_tars_tool = UITarsTool(
-                self.gui_config,
-                gui_skill_store=gui_skill_store,
-                aloha_skill_store=aloha_skill_store,
-                syll_config=self.syll_config,
-            )
+            # gui_action → Enhanced TVAE-verifier pipeline (skill optional),
+            # matching AgentLoop — falls back to UITarsTool if Enhanced import
+            # fails. Gets the same telemetry wiring as gui_action_planned.
+            try:
+                from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
+                    GuiActionTool,
+                )
+                gui_action_tool = GuiActionTool(
+                    self.gui_config, aloha_skill_store, syll_config=self.syll_config,
+                    environment=self.environment,
+                )
+            except ImportError:
+                from syll.agent.gui_skill import GUISkillStore
+                from syll.agent.tools.ui_tars import UITarsTool
+
+                gui_skill_store = GUISkillStore(self.workspace)
+                gui_action_tool = UITarsTool(
+                    self.gui_config,
+                    gui_skill_store=gui_skill_store,
+                    aloha_skill_store=aloha_skill_store,
+                    syll_config=self.syll_config,
+                    environment=self.environment,
+                )
             if self.event_store is not None:
-                ui_tars_tool._event_store = self.event_store
-            tools.register(ui_tars_tool)
+                gui_action_tool._event_store = self.event_store
+            if self.context_meter is not None:
+                gui_action_tool._context_meter = self.context_meter
+            if self.skill_memory is not None:
+                gui_action_tool._skill_memory = self.skill_memory
+            gui_action_tool._audit_workspace = self.workspace
+            tools.register(gui_action_tool)
 
             try:
                 from syll.agent.aloha.act.enhanced.enhanced_planner_tool import (
                     EnhancedAlohaPlannerTool,
                 )
                 planner_tool = EnhancedAlohaPlannerTool(
-                    self.gui_config, aloha_skill_store, syll_config=self.syll_config
+                    self.gui_config, aloha_skill_store, syll_config=self.syll_config,
+                    environment=self.environment,
                 )
             except ImportError:
                 from syll.agent.tools.aloha_planner_tool import AlohaPlannerTool
                 planner_tool = AlohaPlannerTool(
-                    self.gui_config, aloha_skill_store, syll_config=self.syll_config
+                    self.gui_config, aloha_skill_store, syll_config=self.syll_config,
+                    environment=self.environment,
                 )
             if self.event_store is not None:
                 planner_tool._event_store = self.event_store
+            # 0b: thread the Runner's ContextMeter so GUI model calls
+            # (planner/actor/spatial/verify) record usage into this run's
+            # context_curve.jsonl instead of staying invisible.
+            if self.context_meter is not None:
+                planner_tool._context_meter = self.context_meter
+            if self.skill_memory is not None:
+                planner_tool._skill_memory = self.skill_memory
+            # Give the planner tool the run workspace so it logs grounded
+            # actions to {run_workspace}/audit/actions.jsonl (Performance/Runs).
+            planner_tool._audit_workspace = self.workspace
             tools.register(planner_tool)
 
         return tools
@@ -459,21 +541,26 @@ class UnifiedSubagentManager:
         import platform
 
         # GUI delegation: when GUI tools are available, the subagent must DRIVE
-        # the UI through `gui_action_planned` (which grounds via the vision
-        # actor + verifies), NOT via shell/SendKeys or by eyeballing a
-        # screenshot. Shell stays for non-GUI work only.
+        # the UI through `gui_action` (the Enhanced verifier pipeline: vision
+        # actor + TVAE per-step verify), NOT via shell/SendKeys or by eyeballing
+        # a screenshot. Shell stays for non-GUI work only.
         gui_block = ""
         if self.gui_config is not None and getattr(self.gui_config, "enabled", False):
             gui_block = """
 ## GUI / desktop operations (IMPORTANT)
 - To operate ANY graphical UI — open apps, click, type into windows, menus,
-  draw shapes, navigate tabs — call `gui_action_planned(instruction="<what>")`.
+  draw shapes, navigate tabs — call `gui_action(instruction="<what>")`.
   It captures the screen, grounds via a VISION actor, performs the action, and
-  verifies it. This is the ONLY correct way to drive the GUI.
+  verifies it (TVAE pixel-diff + expectation check). This is the ONLY correct
+  way to drive the GUI. skill_name is optional (pass one only if you have a
+  recorded skill to follow).
 - DO NOT use exec/shell/PowerShell/SendKeys/osascript to manipulate windows.
 - DO NOT take a screenshot and guess coordinates — you cannot see the image;
   the GUI tool sees it for you.
 - Use exec/shell ONLY for non-GUI work (run scripts, install deps, file ops).
+- If you do NOT know the exact UI steps for an unfamiliar app or task, FIRST
+  call `video_learn(task="<app> <goal>")` to learn from an online tutorial; it
+  writes a SKILL.md you can then follow via `gui_action(skill_name="<app>")`.
 """
 
         return f"""# Subagent (isolated context)
@@ -494,7 +581,7 @@ Use platform-appropriate commands only — never macOS-only commands (e.g.
 2. Write files using ABSOLUTE paths under the workspace below. Relative paths
    resolve unpredictably; always prefix with the workspace path shown here.
 3. Your `return.summary` must state what you ACTUALLY did (commands run, files
-   read/written, GUI actions performed via gui_action_planned), not a plausible
+   read/written, GUI actions performed via gui_action), not a plausible
    guess. If you could not complete the task, return status="failed" + diagnosis.
 4. Stay strictly within the assigned task -- do not branch or take side tasks.
 {gui_block}
@@ -552,6 +639,9 @@ Use platform-appropriate commands only — never macOS-only commands (e.g.
             "diagnosis": r.diagnosis,
             "lessons": r.lessons,
             "iterations_used": r.iterations_used,
+            "tokens_in": r.tokens_in,
+            "tokens_out": r.tokens_out,
+            "last_prompt_tokens": r.last_prompt_tokens,
         }
 
     def get_running_count(self) -> int:

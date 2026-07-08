@@ -165,32 +165,28 @@ class VideoAnalyzer:
         self.api_base = api_base
         self.scan_interval = scan_interval
         self.context_window = context_window
+        # LLMProvider cache: route through the shared provider so usage is observable.
+        self._provider = None
+        if api_key:
+            try:
+                from syll.providers.litellm_provider import LiteLLMProvider
+                self._provider = LiteLLMProvider(api_key=api_key, api_base=api_base)
+            except Exception:
+                pass
 
     # ── LLM helper ────────────────────────────────────────────────────
 
     async def _call_vision(self, prompt: str, images: list[str],
                            temperature: float = 0.2) -> str:
-        """Call LiteLLM with text + images."""
-        import litellm
-
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for img_b64 in images:
             content.append({"type": "image_url", "image_url": {"url": img_b64}})
 
-        kwargs: dict[str, Any] = {}
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-
-        response = await litellm.acompletion(
-            model=self.model,
+        resp = await self._provider.chat(
             messages=[{"role": "user", "content": content}],
-            temperature=temperature,
-            max_tokens=2000,
-            **kwargs,
+            model=self.model, temperature=temperature, max_tokens=2000,
         )
-        return response.choices[0].message.content
+        return resp.content
 
     @staticmethod
     def _extract_json(text: str) -> Any:
@@ -462,6 +458,83 @@ Important rules:
                 val = re.sub(r"\s{2,}", " ", val).strip()
                 step[key] = val
         return step
+
+    # ── Frame-list analysis (browser-watch path; no downloaded file) ──
+
+    async def analyze_frames(
+        self,
+        frames: list[tuple[float, str, Any]],
+        task_description: str = "",
+        window: int = 3,
+        stride: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Analyze PRE-CAPTURED frames (e.g. screen-sampled while a tutorial plays
+        in a browser) into ordered steps. Same per-step prompt as detailed_analysis,
+        but the frames are supplied directly instead of seeked from a video file.
+
+        Args:
+            frames: ordered (timestamp_s, base64_data_uri, saved_path) tuples.
+            window: frames per step context (before/during/after).
+            stride: window advance between steps.
+        """
+        prompt_path = Path(__file__).parent / "default_prompt.json"
+        base_prompt = ""
+        if prompt_path.exists():
+            try:
+                base_prompt = json.loads(
+                    prompt_path.read_text(encoding="utf-8")
+                ).get("Base Prompt", "")
+            except Exception:
+                base_prompt = ""
+
+        steps: list[dict[str, Any]] = []
+        recent_steps: list[dict] = []
+        step_idx = 1
+        n = len(frames)
+        i = 0
+        while i < n:
+            grp = frames[i : i + window]
+            mid = grp[len(grp) // 2]
+            ts = mid[0]
+            images = [b64 for _, b64, _ in grp if b64]
+            if not images:
+                i += stride
+                continue
+            prompt = self._build_detail_prompt(
+                step_idx, ts, task_description, recent_steps, base_prompt
+            )
+            try:
+                raw = await self._call_vision(prompt, images, temperature=0.15)
+                data = self._extract_json(raw)
+            except Exception as e:
+                logger.warning(f"[VideoAnalyzer] frame analysis failed at {ts:.1f}s: {e}")
+                i += stride
+                continue
+            if isinstance(data, dict) and (data.get("Action") or data.get("action")):
+                step = {
+                    "step_idx": step_idx,
+                    "timestamp": ts,
+                    "action": data.get("Action") or data.get("action") or "",
+                    "observation": data.get("Observation") or data.get("observation") or "",
+                    "think": data.get("Think") or data.get("think") or "",
+                    "expectation": data.get("Expectation") or data.get("expectation") or "",
+                    "screenshot_path": str(mid[2]) if mid[2] else None,
+                }
+                step = self._sanitize_step(step)
+                # skip consecutive duplicate actions (player paused / static frames)
+                if not (steps and step["action"].strip().lower()
+                        == steps[-1]["action"].strip().lower()):
+                    steps.append(step)
+                    recent_steps = (recent_steps + [{
+                        "step_idx": step_idx, "Observation": step["observation"],
+                        "Action": step["action"]}])[-3:]
+                    step_idx += 1
+            i += stride
+
+        for j, s in enumerate(steps, 1):  # re-index after dedup
+            s["step_idx"] = j
+        logger.info(f"[VideoAnalyzer] frame analysis: {len(steps)} steps from {n} frames")
+        return steps
 
     # ── Full pipeline ─────────────────────────────────────────────────
 

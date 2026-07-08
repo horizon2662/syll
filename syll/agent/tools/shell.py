@@ -1,39 +1,49 @@
-"""Shell execution tool."""
+"""Shell execution tool with basic safety guardrails."""
 
-import asyncio
+from __future__ import annotations
+
 import os
-import re
-from pathlib import Path
-from typing import Any
+import shlex
+from dataclasses import dataclass
+from typing import Any, TYPE_CHECKING
 
-from syll.agent.tools.base import Tool
+from syll.agent.tools.base import Tool, ToolResult
+from syll.config.schema import ExecToolConfig
+
+if TYPE_CHECKING:
+    from syll.sandbox.environment import Environment
+
+
+@dataclass
+class ExecToolConfig:
+    """Configuration for ExecTool."""
+
+    timeout: int = 60
+    allowed_commands: list[str] | None = None
 
 
 class ExecTool(Tool):
-    """Tool to execute shell commands."""
+    """Execute a shell command and return stdout/stderr."""
+
+    DANGEROUS_PATTERNS = {
+        "rm -rf /",
+        ":(){ :|:& };:",
+        "dd if=/dev/zero of=/dev/sda",
+        "> /dev/sda",
+        "mkfs",
+    }
 
     def __init__(
         self,
-        timeout: int = 60,
         working_dir: str | None = None,
-        deny_patterns: list[str] | None = None,
-        allow_patterns: list[str] | None = None,
-        restrict_to_workspace: bool = False,
+        timeout: int = 60,
+        restrict_to_workspace: bool = True,
+        environment: "Environment | None" = None,
     ):
-        self.timeout = timeout
         self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
-        ]
-        self.allow_patterns = allow_patterns or []
+        self.timeout = timeout
         self.restrict_to_workspace = restrict_to_workspace
+        self._environment = environment
 
     @property
     def name(self) -> str:
@@ -41,7 +51,10 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return (
+            "Execute a shell command. Returns stdout, stderr, and exit code. "
+            "Supports setting a working directory via working_dir."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -50,92 +63,87 @@ class ExecTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "Shell command to execute. Multiline commands are supported.",
                 },
                 "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for the command"
-                }
+                    "type": ["string", "null"],
+                    "description": "Optional working directory for the command.",
+                },
             },
-            "required": ["command"]
+            "required": ["command"],
         }
 
-    async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
+    def _guard_command(self, command: str, cwd: str) -> str | None:
+        """Return error string if command violates safety rules, else None."""
+        lower = command.lower()
+        for pattern in self.DANGEROUS_PATTERNS:
+            if pattern.lower() in lower:
+                return f"Error: Command blocked by safety guard (contains '{pattern}')."
+
+        if self.restrict_to_workspace and self.working_dir:
+            resolved_cwd = os.path.abspath(cwd)
+            resolved_workspace = os.path.abspath(self.working_dir)
+            if resolved_cwd == resolved_workspace or resolved_cwd.startswith(
+                resolved_workspace + os.sep
+            ):
+                return None
+            return (
+                f"Error: Working directory '{cwd}' is outside the allowed workspace "
+                f"'{self.working_dir}'."
+            )
+        return None
+
+    async def execute(
+        self, command: str, working_dir: str | None = None, **kwargs: Any
+    ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
-        guard_error = self._guard_command(command, cwd)
-        if guard_error:
-            return guard_error
+
+        guard = self._guard_command(command, cwd)
+        if guard:
+            return guard
+
+        if self._environment is not None:
+            result = await self._environment.exec(command, cwd=cwd, timeout=self.timeout)
+            output_parts = []
+            if result.stdout:
+                output_parts.append(result.stdout)
+            if result.stderr:
+                output_parts.append(result.stderr)
+            if result.returncode != 0:
+                output_parts.append(f"Exit code: {result.returncode}")
+            result_text = "\n".join(output_parts)
+            if len(result_text) > 10000:
+                result_text = result_text[:10000] + "\n... [truncated]"
+            return result_text
+
+        # Fallback for callers that have not wired an Environment yet.
+        import asyncio
 
         try:
-            process = await asyncio.create_subprocess_shell(
+            proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                return f"Error: Command timed out after {self.timeout} seconds"
-
-            output_parts = []
-
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-
-            if process.returncode != 0:
-                output_parts.append(f"\nExit code: {process.returncode}")
-
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-
-            # Truncate very long output
-            max_len = 10000
-            if len(result) > max_len:
-                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
-
-            return result
-
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            return "Error: Command timed out."
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            return f"Error executing command: {e}"
 
-    def _guard_command(self, command: str, cwd: str) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
-        cmd = command.strip()
-        lower = cmd.lower()
-
-        for pattern in self.deny_patterns:
-            if re.search(pattern, lower):
-                return "Error: Command blocked by safety guard (dangerous pattern detected)"
-
-        if self.allow_patterns:
-            if not any(re.search(p, lower) for p in self.allow_patterns):
-                return "Error: Command blocked by safety guard (not in allowlist)"
-
-        if self.restrict_to_workspace:
-            if "..\\" in cmd or "../" in cmd:
-                return "Error: Command blocked by safety guard (path traversal detected)"
-
-            cwd_path = Path(cwd).resolve()
-
-            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            posix_paths = re.findall(r"/[^\s\"']+", cmd)
-
-            for raw in win_paths + posix_paths:
-                try:
-                    p = Path(raw).resolve()
-                except Exception:
-                    continue
-                if cwd_path not in p.parents and p != cwd_path:
-                    return "Error: Command blocked by safety guard (path outside working dir)"
-
-        return None
+        output_parts = []
+        decoded_stdout = stdout.decode(errors="replace")
+        decoded_stderr = stderr.decode(errors="replace")
+        if decoded_stdout:
+            output_parts.append(decoded_stdout)
+        if decoded_stderr:
+            output_parts.append(decoded_stderr)
+        if proc.returncode != 0:
+            output_parts.append(f"Exit code: {proc.returncode}")
+        result_text = "\n".join(output_parts)
+        if len(result_text) > 10000:
+            result_text = result_text[:10000] + "\n... [truncated]"
+        return result_text

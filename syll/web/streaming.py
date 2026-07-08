@@ -68,9 +68,26 @@ async def process_streaming(
             language_hint_text=raw_content,
         )
 
+        # Shared per-session meter (same curve file as the non-streaming path).
+        _meter = agent_loop.get_context_meter(session_key)
+
+        # Compact context before entering the streaming loop, mirroring the
+        # non-streaming path. Unknown budgets (0) are ignored.
+        budget_tokens = getattr(_meter, "budget_tokens", 0) or 0
+        if budget_tokens:
+            try:
+                compactor = getattr(agent_loop, "context_compactor", None)
+                if compactor is not None:
+                    messages = await compactor.compact(messages, budget_tokens)
+            except Exception as exc:
+                logger.warning(f"Streaming context compaction failed: {exc}")
+
         iteration = 0
         final_content = None
         collected_media: list[str] = []
+        # Last assistant text across iterations — used as fallback when the
+        # loop exits due to budget exhaustion with empty final content.
+        last_text_content = ""
         # Records every assistant-with-tools and tool-result message so we can
         # persist the full turn into the session JSONL, not just the final reply.
         turn_events: list[dict[str, Any]] = []
@@ -87,10 +104,12 @@ async def process_streaming(
                 reasoning_content = None
                 tool_calls_data: list[dict] = []
 
+                _stream_usage: dict = {}
                 async for chunk in provider.chat_stream(
                     messages=messages,
                     tools=agent_loop.tools.get_definitions(),
                     model=agent_loop.model,
+                    max_tokens=getattr(agent_loop, "_resolve_max_tokens", lambda: 16384)(),
                 ):
                     if chunk["type"] == "token":
                         accumulated_content += chunk["content"]
@@ -99,7 +118,24 @@ async def process_streaming(
                         tool_calls_data = chunk["calls"]
                         reasoning_content = chunk.get("reasoning_content")
                     elif chunk["type"] == "done":
+                        _stream_usage = chunk.get("usage") or {}
+
+                # Meter this streaming call (prompt_tokens from the final chunk).
+                if _meter is not None:
+                    try:
+                        _meter.record(
+                            prompt_tokens=int(_stream_usage.get("prompt_tokens", 0) or 0),
+                            completion_tokens=int(_stream_usage.get("completion_tokens", 0) or 0),
+                            phase="orchestrator",
+                            extra={"iteration": iteration, "streaming": True,
+                                   "had_tool_calls": bool(tool_calls_data)},
+                        )
+                    except Exception:
                         pass
+
+                # Track last assistant text for budget-exhaustion fallback.
+                if accumulated_content:
+                    last_text_content = accumulated_content
 
                 # Process tool calls if any
                 if tool_calls_data:
@@ -165,7 +201,30 @@ async def process_streaming(
                     messages=messages,
                     tools=agent_loop.tools.get_definitions(),
                     model=agent_loop.model,
+                    max_tokens=getattr(agent_loop, "_resolve_max_tokens", lambda: 16384)(),
                 )
+
+                # Meter the non-streaming call.
+                if _meter is not None:
+                    try:
+                        _u = response.usage or {}
+                        _meter.record(
+                            prompt_tokens=int(_u.get("prompt_tokens", 0) or 0),
+                            completion_tokens=int(_u.get("completion_tokens", 0) or 0),
+                            phase="orchestrator",
+                            extra={"iteration": iteration, "streaming": False,
+                                   "had_tool_calls": response.has_tool_calls},
+                        )
+                    except Exception:
+                        pass
+
+                # Track last assistant text for budget-exhaustion fallback.
+                if response.content:
+                    last_text_content = response.content
+                elif not response.has_tool_calls:
+                    rc = response.provider_extra.get("reasoning_content")
+                    if rc:
+                        last_text_content = rc[:2000]
 
                 if response.has_tool_calls:
                     tool_call_dicts = [
@@ -224,12 +283,19 @@ async def process_streaming(
                         }
                 else:
                     final_content = response.content
+                    # Also check reasoning_content (extended thinking models may
+                    # put all output in reasoning and leave content empty).
+                    if not final_content:
+                        rc = response.provider_extra.get("reasoning_content")
+                        if rc:
+                            final_content = rc[:2000]
                     if final_content:
                         yield {"type": "token", "content": final_content}
                     break
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+        if not final_content:
+            # Use the best content we collected across iterations.
+            final_content = last_text_content or "⚠️ Agent completed but produced no text response."
 
         # Save to session — replay full turn so reload preserves tool_calls.
         session.add_message("user", raw_content)
@@ -269,6 +335,14 @@ async def process_streaming(
             agent_loop.context.memory.append_today(summary)
         except Exception as e:
             logger.debug(f"Failed to append daily memory: {e}")
+
+        # Memory flush turn: promote reusable facts to long-term memory.
+        try:
+            flusher = getattr(agent_loop, "memory_flusher", None)
+            if flusher is not None:
+                await flusher.flush(raw_content, final_content)
+        except Exception as e:
+            logger.debug(f"Memory flush turn failed: {e}")
 
         # Encode collected media for done event
         done_media = _encode_media(collected_media) if collected_media else []

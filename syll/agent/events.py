@@ -146,10 +146,6 @@ class EventStore:
         Returns:
             Event or None if not found
         """
-        # Search recent 30 days
-        end_date = date.today()
-        end_date - timedelta(days=30)
-
         for event_file in self.events_dir.glob("*.jsonl"):
             try:
                 with event_file.open("r", encoding="utf-8") as f:

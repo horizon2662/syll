@@ -121,6 +121,7 @@ async def test_execute_planner_returns_screenshots():
     )
     tmp.write(png_data)
     tmp.flush()
+    tmp.close()
     tmp_path = tmp.name
 
     agent_loop = MagicMock()
