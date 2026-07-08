@@ -92,6 +92,9 @@ class AgentLoop:
             pass
         self.sessions = SessionManager(workspace)
         self.environment = LocalEnvironment(workspace_root=workspace)
+        from syll.agent.longhorizon.code_skill import CodeSkillLibrary
+
+        self.code_skill_library = CodeSkillLibrary(workspace / "code_skills")
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -351,6 +354,18 @@ class AgentLoop:
 
         planner_tool._event_store = self.event_store
         self.tools.register(planner_tool)
+
+        # Phase 2: code-as-policy skill library (Aspire). Registered alongside
+        # gui_action so the agent can run a validated code skill per step.
+        from syll.agent.tools.code_skill_tool import RunCodeSkillTool
+
+        code_skill_tool = RunCodeSkillTool(
+            self.code_skill_library,
+            environment=self.environment,
+            syll_config=self.syll_config,
+        )
+        code_skill_tool._event_store = self.event_store
+        self.tools.register(code_skill_tool)
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""

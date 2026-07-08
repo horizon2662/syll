@@ -182,6 +182,11 @@ class UnifiedSubagentManager:
         # L2: SkillMemory threaded from the Runner so failed GUI-step
         # diagnoses can be lifted into SKILL.md (lesson upflow).
         self.skill_memory = skill_memory
+        # Phase 2: global code-as-policy skill library (Aspire). Validated
+        # repairs compound across tasks; the run_code_skill tool exposes them.
+        from syll.agent.longhorizon.code_skill import CodeSkillLibrary
+
+        self.code_skill_library = CodeSkillLibrary(workspace / "code_skills")
         self._running: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
@@ -535,10 +540,40 @@ class UnifiedSubagentManager:
             planner_tool._audit_workspace = self.workspace
             tools.register(planner_tool)
 
+            # Phase 2: code-as-policy skill library (Aspire). Registered
+            # alongside gui_action so the agent can, per step, run a validated
+            # code skill instead of many pixel clicks.
+            from syll.agent.tools.code_skill_tool import RunCodeSkillTool
+
+            code_skill_tool = RunCodeSkillTool(
+                self.code_skill_library,
+                environment=self.environment,
+                syll_config=self.syll_config,
+            )
+            if self.event_store is not None:
+                code_skill_tool._event_store = self.event_store
+            if self.context_meter is not None:
+                code_skill_tool._context_meter = self.context_meter
+            code_skill_tool._audit_workspace = self.workspace
+            tools.register(code_skill_tool)
+
         return tools
 
     def _build_prompt(self, contract: SubagentContract, skill_ctx: str) -> str:
         import platform
+
+        # Phase 2: surface validated code-as-policy skills relevant to this
+        # objective so the agent can call run_code_skill instead of re-deriving
+        # a fragile pixel sequence.
+        _code_skills = self.code_skill_library.get_relevant(
+            getattr(contract, "objective", None) or ""
+        )
+        if _code_skills:
+            skill_ctx = (skill_ctx or "") + (
+                "\n\n## Available code-as-policy skills (validated; prefer "
+                "run_code_skill over many pixel clicks when one fits)\n"
+                + _code_skills
+            )
 
         # GUI delegation: when GUI tools are available, the subagent must DRIVE
         # the UI through `gui_action` (the Enhanced verifier pipeline: vision
