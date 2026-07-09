@@ -20,33 +20,51 @@ import subprocess
 
 import pytest
 
-from syll.sandbox.backends.docker import DockerEnvironment
+from syll.sandbox.backends.docker import DockerEnvironment, docker_exe
 from syll.sandbox.verifiers import FileVerifier
 
 IMAGE = "syll-sandbox-base:latest"
+_DOCKER = docker_exe()
 
 
-def _docker_available() -> bool:
-    return shutil.which("docker") is not None
+def _daemon_running() -> bool:
+    """True if the docker CLI is resolvable AND the engine responds."""
+    if _DOCKER is None:
+        return False
+    try:
+        return subprocess.run(
+            [_DOCKER, "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, timeout=20,
+        ).returncode == 0
+    except Exception:
+        return False
 
 
 def _image_available() -> bool:
-    if not _docker_available():
+    if not _daemon_running():
         return False
-    return subprocess.run(
-        ["docker", "image", "inspect", IMAGE], capture_output=True
-    ).returncode == 0
+    try:
+        return subprocess.run(
+            [_DOCKER, "image", "inspect", IMAGE], capture_output=True, timeout=20
+        ).returncode == 0
+    except Exception:
+        return False
 
 
 pytestmark = pytest.mark.skipif(
     not _image_available(),
-    reason=f"needs docker + {IMAGE}; build with `docker build -t {IMAGE} "
-    "-f syll/sandbox/docker/Dockerfile syll/sandbox/docker`",
+    reason=(
+        f"needs a RUNNING docker daemon + image {IMAGE}. Resolve docker "
+        "(PATH or Docker Desktop default), start Docker Desktop, then build: "
+        f"`docker build -t {IMAGE} -f syll/sandbox/docker/Dockerfile syll/sandbox/docker`"
+    ),
 )
 
 
 def _rm_container(name: str) -> None:
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    if _DOCKER is None:
+        return
+    subprocess.run([_DOCKER, "rm", "-f", name], capture_output=True)
 
 
 @pytest.mark.anyio

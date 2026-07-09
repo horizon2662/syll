@@ -21,11 +21,33 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import secrets
+import shutil
 from dataclasses import dataclass
 from typing import Any
 
 from syll.sandbox.environment import Environment, ExecResult, SafetyResult
+
+# Docker Desktop's default install location (Windows) — used when `docker`
+# isn't on the PATH the Python process inherited (common when launching from
+# Git Bash, where Docker Desktop's bin is absent from the inherited PATH).
+_DOCKER_DD_PATHS = (
+    r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    r"C:\Program Files\Docker\Docker\resources\bin\docker",
+    "/usr/local/bin/docker",
+    "/usr/bin/docker",
+)
+
+
+def docker_exe() -> str | None:
+    """Resolve the docker CLI: PATH first, then Docker Desktop's default
+    location. Returns ``None`` if no docker executable is found."""
+    return (
+        shutil.which("docker")
+        or shutil.which("docker.exe")
+        or next((p for p in _DOCKER_DD_PATHS if os.path.exists(p)), None)
+    )
 
 
 @dataclass
@@ -56,12 +78,20 @@ class DockerEnvironment(Environment):
         self._spec = _ContainerSpec(image=image, name=container or self._gen_name(), workspace_root=workspace_root)
         self._run_args = run_args
         self._started = False
+        # Resolve the docker CLI once (PATH, else Docker Desktop default path).
+        self._docker = docker_exe()
 
     # ------------------------------------------------------------------
     # Container lifecycle
     # ------------------------------------------------------------------
     async def ensure_started(self) -> None:
         """Create + start the container if it isn't already running."""
+        if self._docker is None:
+            raise RuntimeError(
+                "docker CLI not found on PATH or at Docker Desktop's default "
+                "location (C:\\Program Files\\Docker\\Docker\\resources\\bin). "
+                "Start Docker Desktop and/or add it to PATH."
+            )
         if await self._container_running():
             self._started = True
             return
@@ -207,7 +237,7 @@ class DockerEnvironment(Environment):
     ) -> ExecResult:
         await self.ensure_started()
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-i", self._spec.name, "sh", "-c", inner,
+            self._docker, "exec", "-i", self._spec.name, "sh", "-c", inner,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -229,7 +259,7 @@ class DockerEnvironment(Environment):
 
     async def _docker(self, *args: str) -> ExecResult:
         proc = await asyncio.create_subprocess_exec(
-            "docker", *args,
+            self._docker, *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -241,7 +271,7 @@ class DockerEnvironment(Environment):
 
     async def _container_running(self) -> bool:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "ps", "--filter", f"name=^{self._spec.name}$", "--format", "{{.Names}}",
+            self._docker, "ps", "--filter", f"name=^{self._spec.name}$", "--format", "{{.Names}}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -252,7 +282,7 @@ class DockerEnvironment(Environment):
         # Remove the current container (ignore failure if absent) and start a
         # fresh one from `image`. This is the deterministic full-reset path.
         kill = await asyncio.create_subprocess_exec(
-            "docker", "rm", "-f", self._spec.name,
+            self._docker, "rm", "-f", self._spec.name,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await kill.communicate()
