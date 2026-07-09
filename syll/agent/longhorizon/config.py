@@ -30,6 +30,10 @@ class RunnerConfig:
     retry_context: str = "fresh"   # fresh | replay  (A1 context-sovereignty switch)
     max_retries_per_step: int = 3  # only used when recovery_mode includes retry
     context_window: int = 0  # input-token budget for the detector (0 = litellm lookup); SYLL_CONTEXT_WINDOW
+    # --- Phase 3: online evolution loop (default off; SYLL_ENABLE_EVOLUTION) ---
+    enable_evolution: bool = False
+    evolution_variants: int = 3
+    evolution_beta_threshold: float = 0.3  # refuse to evolve above this false-success rate
 
     @classmethod
     def from_env(
@@ -55,6 +59,8 @@ class RunnerConfig:
             retry_context=os.environ.get("SYLL_RETRY_CONTEXT", "fresh"),
             max_retries_per_step=int(os.environ.get("SYLL_MAX_RETRIES", "3")),
             context_window=int(os.environ.get("SYLL_CONTEXT_WINDOW", "0")),
+            enable_evolution=os.environ.get("SYLL_ENABLE_EVOLUTION", "").lower()
+            in ("1", "true", "yes"),
         )
 
     @property

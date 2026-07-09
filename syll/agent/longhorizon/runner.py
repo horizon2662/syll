@@ -150,6 +150,26 @@ class Runner:
         self.session = SessionState(ws, cfg.skill)
         self._notes: list[str] = []  # orchestrator working memory (compacted)
         self._compaction_summary: str = ""
+        # Phase 3: online evolution (default off). On step failure the Evolver
+        # (diagnose -> patch -> validate -> distill) may learn a code-as-policy
+        # skill for next time, gated by the verifier-ceiling β estimate. Uses the
+        # same global code-skill library the agent reads (workspace/code_skills).
+        # Generation runs against self.environment; for unverified-code isolation
+        # prefer a Docker sandbox env_factory.
+        self._evolve_pass = 0
+        self._evolve_false_success = 0
+        self.evolver = None
+        if getattr(self.cfg, "enable_evolution", False):
+            from .evolution import Evolver
+
+            self.evolver = Evolver(
+                self.subagents.code_skill_library,
+                env_factory=lambda: LocalEnvironment(workspace_root=ws),
+                provider=self.provider,
+                model=cfg.model,
+                beta_threshold=getattr(cfg, "evolution_beta_threshold", 0.3),
+                variants=getattr(cfg, "evolution_variants", 3),
+            )
 
     # ------------------------------------------------------------------
     # entry point
@@ -230,6 +250,11 @@ class Runner:
                     print(f"  ~ attempt {attempt} failed -> retry_same_node "
                           f"({self.cfg.retry_context}) [{attempt}/{retry_budget}]")
 
+            if not result.ok:
+                # Phase 3: fire-and-forget skill evolution on failure (default
+                # off + β-gated inside; never blocks the replan/give-up flow).
+                await self._maybe_evolve(plan, step, cur_milestone, result)
+
             if result.ok:
                 self._record_step_success(plan, step, cur_milestone, result)
                 i += 1
@@ -286,6 +311,47 @@ class Runner:
             f"M{cur_milestone}.S{step.index} ok: {result.summary[:120]}"
         )
         self._notes.append(f"step {step.index} ok: {result.summary[:200]}")
+
+    @property
+    def _evolution_beta(self) -> float | None:
+        """Running false-success rate of the agent's self-judgement (β)."""
+        if self._evolve_pass == 0:
+            return None
+        return self._evolve_false_success / self._evolve_pass
+
+    async def _maybe_evolve(self, plan, step, cur_milestone, result) -> None:
+        """Phase 3 hook: on step failure, try to learn a code-as-policy skill.
+
+        Default-off (``cfg.enable_evolution``) and β-gated inside the Evolver.
+        Builds a verifier gate from the step's expected artifacts; fire-and-forget
+        — logs the report and never blocks the normal replan / give-up flow.
+        """
+        if self.evolver is None:
+            return
+        artifacts = list(getattr(result, "artifacts", []) or [])
+        if not artifacts:
+            logger.debug(f"[evolve] step {step.index}: no artifacts to gate on; skip")
+            return
+        from .evolution import FailureCase
+
+        failure = FailureCase(
+            instruction=step.description,
+            diagnosis=(result.diagnosis or "")[:500],
+            checks=[{"type": "file", "require_exists": artifacts}],
+            trace_summary=(result.summary or "")[:400],
+        )
+        beta = self._evolution_beta
+        report = await self.evolver.evolve(failure, beta=beta)
+        if report.evolved:
+            logger.info(
+                f"[evolve] step {step.index}: installed {report.installed_names} "
+                f"(β={beta})"
+            )
+            self.global_mem.log(
+                f"M{cur_milestone}.S{step.index} evolved skills {report.installed_names}"
+            )
+        else:
+            logger.info(f"[evolve] step {step.index}: {report.reason} (β={beta})")
 
     def _give_up_step(
         self, plan, step, cur_milestone, result, *, lesson: str, log_msg: str
@@ -477,6 +543,12 @@ class Runner:
 
         verdict = "PASS" if result.ok else "FAIL"  # captured BEFORE the oracle gate
         oracle_label, oracle_detail, result = self._apply_oracle(step, cur_milestone, result)
+        # Phase 3: feed the verifier-ceiling β estimate (verdict is the agent's
+        # noisy self-judgement pre-oracle; oracle_label is the deterministic one).
+        if verdict == "PASS":
+            self._evolve_pass += 1
+            if oracle_label == "wrong":
+                self._evolve_false_success += 1
 
         self._emit_telemetry(
             step=step, cur_milestone=cur_milestone, attempt=attempt, seq=seq,
