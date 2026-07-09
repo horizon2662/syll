@@ -95,7 +95,7 @@ class DockerEnvironment(Environment):
         if await self._container_running():
             self._started = True
             return
-        await self._docker(
+        await self._docker_run(
             "run", "-d", "--name", self._spec.name, *self._run_args.split(),
             self._spec.image, "tail", "-f", "/dev/null",
         )
@@ -104,7 +104,7 @@ class DockerEnvironment(Environment):
     async def checkpoint(self, tag: str) -> str:
         await self.ensure_started()
         image_tag = f"{self._spec.name}:{tag}"
-        await self._docker("commit", self._spec.name, image_tag)
+        await self._docker_run("commit", self._spec.name, image_tag)
         return image_tag
 
     async def restore(self, checkpoint_id: str) -> None:
@@ -257,7 +257,7 @@ class DockerEnvironment(Environment):
             proc.returncode or 0,
         )
 
-    async def _docker(self, *args: str) -> ExecResult:
+    async def _docker_run(self, *args: str) -> ExecResult:
         proc = await asyncio.create_subprocess_exec(
             self._docker, *args,
             stdout=asyncio.subprocess.PIPE,
@@ -286,7 +286,7 @@ class DockerEnvironment(Environment):
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await kill.communicate()
-        await self._docker(
+        await self._docker_run(
             "run", "-d", "--name", self._spec.name, *self._run_args.split(),
             image, "tail", "-f", "/dev/null",
         )

@@ -108,3 +108,14 @@ async def test_wait_sleeps(env: LocalEnvironment):
     await env.wait(100)
     elapsed = asyncio.get_event_loop().time() - start
     assert 0.08 <= elapsed <= 0.3
+
+
+def test_docker_environment_separates_exe_path_from_run_method():
+    """Regression: the resolved docker CLI path (self._docker, a str) must NOT
+    shadow the command-runner method (_docker_run). Catchable without a daemon.
+    """
+    from syll.sandbox.backends.docker import DockerEnvironment
+
+    d = DockerEnvironment(image="x")
+    assert isinstance(d._docker, str), "self._docker must be the resolved CLI path"
+    assert callable(d._docker_run), "self._docker_run must remain the runner method"
