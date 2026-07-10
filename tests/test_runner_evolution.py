@@ -72,7 +72,22 @@ async def test_maybe_evolve_skips_without_evolver(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_maybe_evolve_delegates_with_artifacts(tmp_path: Path):
+async def test_maybe_evolve_skips_when_no_artifacts(tmp_path: Path):
+    runner = _make_runner(tmp_path, enable_evolution=False)
+    stub = _StubEvolver()
+    runner.evolver = stub
+    step = SimpleNamespace(index=1, description="do thing")
+    result = SimpleNamespace(artifacts=[], diagnosis="d", summary="s")
+    await runner._maybe_evolve(plan=None, step=step, cur_milestone=1, result=result)
+    assert stub.calls == []  # nothing to gate on → skip
+
+
+@pytest.mark.anyio
+async def test_maybe_evolve_delegates_with_artifacts(tmp_path: Path, monkeypatch):
+    # The Docker pre-check must pass so the injected stub actually runs.
+    monkeypatch.setattr(
+        "syll.sandbox.backends.docker.docker_daemon_up", lambda **k: True
+    )
     runner = _make_runner(tmp_path, enable_evolution=False)
     stub = _StubEvolver()
     runner.evolver = stub  # inject
@@ -91,11 +106,35 @@ async def test_maybe_evolve_delegates_with_artifacts(tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_maybe_evolve_skips_when_no_artifacts(tmp_path: Path):
+async def test_maybe_evolve_skips_when_daemon_down(tmp_path: Path, monkeypatch):
+    """Docker down → skip WITHOUT calling the evolver (don't burn an LLM call)."""
+    monkeypatch.setattr(
+        "syll.sandbox.backends.docker.docker_daemon_up", lambda **k: False
+    )
     runner = _make_runner(tmp_path, enable_evolution=False)
     stub = _StubEvolver()
     runner.evolver = stub
     step = SimpleNamespace(index=1, description="do thing")
-    result = SimpleNamespace(artifacts=[], diagnosis="d", summary="s")
+    result = SimpleNamespace(artifacts=["out/a.txt"], diagnosis="d", summary="s")
     await runner._maybe_evolve(plan=None, step=step, cur_milestone=1, result=result)
-    assert stub.calls == []  # nothing to gate on → skip
+    assert stub.calls == []  # daemon down → never proposed
+
+
+@pytest.mark.anyio
+async def test_maybe_evolve_catches_evolve_error(tmp_path: Path, monkeypatch):
+    """An evolve() crash must never propagate — the run continues regardless."""
+    monkeypatch.setattr(
+        "syll.sandbox.backends.docker.docker_daemon_up", lambda **k: True
+    )
+
+    class _Boom:
+        async def evolve(self, failure, beta=None):
+            raise RuntimeError("sandbox exploded")
+
+    runner = _make_runner(tmp_path, enable_evolution=False)
+    runner.evolver = _Boom()
+    step = SimpleNamespace(index=1, description="do thing")
+    result = SimpleNamespace(artifacts=["out/a.txt"], diagnosis="d", summary="s")
+    # Must not raise.
+    await runner._maybe_evolve(plan=None, step=step, cur_milestone=1, result=result)
+

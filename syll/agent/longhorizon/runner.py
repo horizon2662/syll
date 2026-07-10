@@ -102,6 +102,12 @@ class Runner:
             syll_cfg = None
         gui_cfg = syll_cfg.tools.gui if syll_cfg is not None else None
         self._gui_enabled = gui_cfg is not None and getattr(gui_cfg, "enabled", False)
+        # Sandbox image for the evolution loop's candidate-validation env (Phase 3).
+        self._sandbox_image = "syll-sandbox-base:latest"
+        if syll_cfg is not None:
+            _sb = getattr(getattr(syll_cfg, "tools", None), "sandbox", None)
+            if _sb is not None and getattr(_sb, "image", ""):
+                self._sandbox_image = _sb.image
 
         # Optional event store for the GUI tools (None is fine — they degrade).
         try:
@@ -160,11 +166,13 @@ class Runner:
         self._evolve_false_success = 0
         self.evolver = None
         if getattr(self.cfg, "enable_evolution", False):
+            from syll.sandbox.backends.docker import DockerEnvironment
             from .evolution import Evolver
 
+            sandbox_image = self._sandbox_image
             self.evolver = Evolver(
                 self.subagents.code_skill_library,
-                env_factory=lambda: LocalEnvironment(workspace_root=ws),
+                env_factory=lambda: DockerEnvironment(image=sandbox_image),
                 provider=self.provider,
                 model=cfg.model,
                 beta_threshold=getattr(cfg, "evolution_beta_threshold", 0.3),
@@ -322,15 +330,24 @@ class Runner:
     async def _maybe_evolve(self, plan, step, cur_milestone, result) -> None:
         """Phase 3 hook: on step failure, try to learn a code-as-policy skill.
 
-        Default-off (``cfg.enable_evolution``) and β-gated inside the Evolver.
-        Builds a verifier gate from the step's expected artifacts; fire-and-forget
-        — logs the report and never blocks the normal replan / give-up flow.
+        Gated by ``cfg.enable_evolution`` and β-gated inside the Evolver. Builds a
+        verifier gate from the step's expected artifacts; fire-and-forget — logs
+        the report and never blocks the normal replan / give-up flow. Candidate
+        skills are validated inside a disposable Docker sandbox (``env_factory``);
+        if the daemon is down or evolution errors, it logs + continues — the run
+        never breaks because of it.
         """
         if self.evolver is None:
             return
         artifacts = list(getattr(result, "artifacts", []) or [])
         if not artifacts:
             logger.debug(f"[evolve] step {step.index}: no artifacts to gate on; skip")
+            return
+        # Don't burn an LLM propose call if the Docker sandbox isn't up.
+        from syll.sandbox.backends.docker import docker_daemon_up
+
+        if not docker_daemon_up():
+            logger.info(f"[evolve] step {step.index}: Docker daemon not reachable; skip")
             return
         from .evolution import FailureCase
 
@@ -341,7 +358,13 @@ class Runner:
             trace_summary=(result.summary or "")[:400],
         )
         beta = self._evolution_beta
-        report = await self.evolver.evolve(failure, beta=beta)
+        try:
+            report = await self.evolver.evolve(failure, beta=beta)
+        except Exception as exc:  # evolution must never break the run
+            logger.warning(
+                f"[evolve] step {step.index}: evolve errored ({exc!r}); continue"
+            )
+            return
         if report.evolved:
             logger.info(
                 f"[evolve] step {step.index}: installed {report.installed_names} "

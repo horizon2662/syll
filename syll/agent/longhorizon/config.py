@@ -59,8 +59,10 @@ class RunnerConfig:
             retry_context=os.environ.get("SYLL_RETRY_CONTEXT", "fresh"),
             max_retries_per_step=int(os.environ.get("SYLL_MAX_RETRIES", "3")),
             context_window=int(os.environ.get("SYLL_CONTEXT_WINDOW", "0")),
-            enable_evolution=os.environ.get("SYLL_ENABLE_EVOLUTION", "").lower()
-            in ("1", "true", "yes"),
+            # Evolution defaults ON for the longhorizon Runner (the self-evolution
+            # entry point); set SYLL_ENABLE_EVOLUTION=0/false/no/off to disable.
+            enable_evolution=os.environ.get("SYLL_ENABLE_EVOLUTION", "1")
+            .lower() not in ("0", "false", "no", "off"),
         )
 
     @property

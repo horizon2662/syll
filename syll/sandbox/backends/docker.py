@@ -24,6 +24,7 @@ import base64
 import os
 import secrets
 import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +49,28 @@ def docker_exe() -> str | None:
         or shutil.which("docker.exe")
         or next((p for p in _DOCKER_DD_PATHS if os.path.exists(p)), None)
     )
+
+
+def docker_daemon_up(timeout: float = 10.0) -> bool:
+    """Cheap reachability probe: is the docker engine actually running?
+
+    Used to decide whether to attempt sandbox-backed evolution without burning
+    an LLM propose call when the daemon is down.
+    """
+    exe = docker_exe()
+    if exe is None:
+        return False
+    try:
+        return (
+            subprocess.run(
+                [exe, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True,
+                timeout=timeout,
+            ).returncode
+            == 0
+        )
+    except Exception:
+        return False
 
 
 @dataclass
