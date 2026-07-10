@@ -75,6 +75,7 @@ def _make_agent_loop(mcp_manager=None):
 # ── reload_mcp_tools idempotency + ownership ─────────────────────────────
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_reload_mcp_tools_registers_owned_set(repo_root, monkeypatch):
     monkeypatch.chdir(repo_root)
@@ -95,6 +96,7 @@ async def test_reload_mcp_tools_registers_owned_set(repo_root, monkeypatch):
         await mgr.stop()
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_reload_mcp_tools_idempotent(repo_root, monkeypatch):
     """Repeated reloads must not duplicate or strand entries."""
@@ -118,6 +120,7 @@ async def test_reload_mcp_tools_idempotent(repo_root, monkeypatch):
         await mgr.stop()
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_reload_drops_stale_entries_when_server_removed(repo_root, monkeypatch):
     """After remove_server + reload, the entries are gone from the registry."""
@@ -143,6 +146,7 @@ async def test_reload_drops_stale_entries_when_server_removed(repo_root, monkeyp
 # ── Collision protection ──────────────────────────────────────────────────
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_reload_does_not_clobber_non_mcp_tool(repo_root, monkeypatch, caplog):
     """If a builtin tool happens to have the same name as an MCP adapter,
@@ -209,6 +213,7 @@ def _make_subagent_manager(mcp_manager=None):
     )
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_subagent_propagates_only_opted_in_servers(repo_root, monkeypatch):
     """Two servers, one with propagate_to_subagents=True and one False; the
@@ -238,6 +243,7 @@ async def test_subagent_propagates_only_opted_in_servers(repo_root, monkeypatch)
         await mgr.stop()
 
 
+@pytest.mark.anyio
 @pytest.mark.timeout(60)
 async def test_subagent_run_registers_propagating_tools(repo_root, monkeypatch):
     """End-to-end shape: invoke the subagent's per-spawn registry-build path
